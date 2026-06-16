@@ -18,17 +18,18 @@ class RootService {
   }
 
   static Future<String> getRefreshRate() async {
-    return await runCommand('settings get system peak_refresh_rate');
+    final result = await runCommand('settings get system peak_refresh_rate');
+    return result.replaceAll('.0', '');
   }
 
   // ===== RAM =====
   static Future<String> clearRam() async {
     return await runCommand('''
       for pkg in \$(cmd package list packages -3 | cut -f2 -d:); do
-        if [ "\$pkg" != "com.dts.freefiremax" ] && [ "\$pkg" != "com.mobile.legends" ]; then
-          am force-stop \$pkg 2>/dev/null
-        fi
+        am force-stop \$pkg 2>/dev/null
       done
+      sync
+      echo 3 > /proc/sys/vm/drop_caches
       echo "RAM cleared"
     ''');
   }
@@ -48,18 +49,21 @@ class RootService {
   // ===== CPU/GPU =====
   static Future<String> lockPerformance() async {
     return await runCommand('''
-      echo performance > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
-      echo performance > /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor
+      for i in 0 1 2 3; do echo performance > /sys/devices/system/cpu/cpu\${i}/cpufreq/scaling_governor; echo 2000000 > /sys/devices/system/cpu/cpu\${i}/cpufreq/scaling_min_freq; done
+      for i in 4 5 6; do echo performance > /sys/devices/system/cpu/cpu\${i}/cpufreq/scaling_governor; echo 3000000 > /sys/devices/system/cpu/cpu\${i}/cpufreq/scaling_min_freq; done
       echo performance > /sys/devices/system/cpu/cpu7/cpufreq/scaling_governor
-      echo "CPU locked to performance"
+      echo 3100000 > /sys/devices/system/cpu/cpu7/cpufreq/scaling_min_freq
+      echo 3100000 > /sys/devices/system/cpu/cpufreq/policy7/scaling_max_freq
+      echo 950000000 > /sys/class/devfreq/13000000.mali/min_freq
+      echo 0 > /proc/mtk_scheduler/capacity_margin
+      echo "CPU+GPU locked to performance"
     ''');
   }
 
   static Future<String> unlockPerformance() async {
     return await runCommand('''
-      echo schedutil > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
-      echo schedutil > /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor
-      echo schedutil > /sys/devices/system/cpu/cpu7/cpufreq/scaling_governor
+      for i in 0 1 2 3 4 5 6 7; do echo schedutil > /sys/devices/system/cpu/cpu\${i}/cpufreq/scaling_governor; echo 500000 > /sys/devices/system/cpu/cpu\${i}/cpufreq/scaling_min_freq; done
+      echo 20 > /proc/mtk_scheduler/capacity_margin
       echo "CPU restored to schedutil"
     ''');
   }
@@ -69,7 +73,7 @@ class RootService {
   }
 
   static Future<String> getCpuFreq() async {
-    return await runCommand("cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq | awk '{printf \"%.0f MHz\", \$1/1000}'");
+    return await runCommand("cat /sys/devices/system/cpu/cpu7/cpufreq/scaling_cur_freq | awk '{printf \"%.0f MHz\", \$1/1000}'");
   }
 
   // ===== LTE BAND =====
@@ -117,8 +121,8 @@ class RootService {
     final band = await getBandStatus();
 
     return {
-      'battery': '$battery%',
-      'temp': temp,
+      'battery': battery.isEmpty ? 'N/A' : '$battery%',
+      'temp': temp.isEmpty ? 'N/A' : temp,
       'cpu_freq': cpuFreq,
       'governor': governor,
       'refresh_rate': '${refreshRate}Hz',
