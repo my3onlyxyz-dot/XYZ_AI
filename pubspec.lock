@@ -41,6 +41,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.19.1"
+  cupertino_icons:
+    dependency: "direct main"
+    description:
+      name: cupertino_icons
+      sha256: "41e005c33bd814be4d3096aff55b1908d419fde52ca656c8c47719ec745873cd"
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.0.9"
   fake_async:
     dependency: transitive
     description:
@@ -62,14 +70,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "3.0.2"
-  flutter_root_checker:
-    dependency: "direct main"
-    description:
-      name: flutter_root_checker
-      sha256: b9965d09171be3ba3e105369b4eb5d109641e31e0ea1af9ea05fa50b438a1ad1
-      url: "https://pub.dev"
-    source: hosted
-    version: "1.0.1"
   flutter_test:
     dependency: "direct dev"
     description: flutter
@@ -139,14 +139,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.9.1"
-  root_access:
-    dependency: "direct main"
-    description:
-      name: root_access
-      sha256: "1a1f28327a957529acb12fe1c4dd57eeeef2dae3a0d172d2da4fd700eb037e3a"
-      url: "https://pub.dev"
-    source: hosted
-    version: "1.0.4"
   sky_engine:
     dependency: transitive
     description: flutter
