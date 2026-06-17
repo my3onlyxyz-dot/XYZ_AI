@@ -1,8 +1,16 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'screens/home_screen.dart';
 
 void main() {
-  runApp(const SahrulControlApp());
+  // Jaring pengaman terakhir: kalau ada error async yang lolos dari
+  // semua try-catch di RootService/HomeScreen, app tidak force-close,
+  // errornya hanya dicetak ke console.
+  runZonedGuarded(() {
+    runApp(const SahrulControlApp());
+  }, (error, stack) {
+    debugPrint('Uncaught error (diredam, app tetap berjalan): $error');
+  });
 }
 
 class SahrulControlApp extends StatelessWidget {

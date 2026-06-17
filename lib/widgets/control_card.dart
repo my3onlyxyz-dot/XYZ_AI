@@ -6,7 +6,7 @@ class ControlCard extends StatelessWidget {
   final String subtitle;
   final String buttonLabel;
   final Color buttonColor;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
 
   const ControlCard({
     super.key,
