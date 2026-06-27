@@ -17,22 +17,32 @@ void main() {
 }
 
 // ============================================================
-// PALET "FLIGHT DECK"
+// PALET "FLIGHT DECK" + DUKUNGAN NIGHT / LIGHT
 // ============================================================
-const kBg       = Color(0xFF0A0A0F);
-const kPanel    = Color(0xFF12121A);
-const kPanel2   = Color(0xFF161622);
-const kBorder   = Color(0xFF1E1E2E);
+// Notifier global untuk mode tema. true = night (default), false = light.
+final isNightNotifier = ValueNotifier<bool>(true);
+bool get _night => isNightNotifier.value;
+
+// Warna AKSEN tetap (sama di kedua mode — sudah cerah & kontras).
 const kCyan     = Color(0xFF00E5FF);
-const kGreen    = Color(0xFF69FF47);
-const kYellow   = Color(0xFFFFD700);
+const kGreen    = Color(0xFF34C759);
+const kYellow   = Color(0xFFE6A700);
 const kRed      = Color(0xFFFF4747);
 const kOrange   = Color(0xFFFF6B47);
 const kPurple   = Color(0xFFB47FFF);
-const kTeal     = Color(0xFF47FFEC);
-const kWhite    = Colors.white;
+const kTeal     = Color(0xFF13B5A6);
 
-Color mut(double o) => Colors.white.withOpacity(o);
+// Warna PERMUKAAN/TEKS — dinamis mengikuti mode.
+Color get kBg     => _night ? const Color(0xFF0A0A0F) : const Color(0xFFF2F4F8);
+Color get kPanel  => _night ? const Color(0xFF12121A) : const Color(0xFFFFFFFF);
+Color get kPanel2 => _night ? const Color(0xFF161622) : const Color(0xFFEDEFF5);
+Color get kBorder => _night ? const Color(0xFF1E1E2E) : const Color(0xFFE2E5EC);
+Color get kWhite  => _night ? Colors.white : const Color(0xFF12121A);
+
+// Teks samar (mengikuti mode supaya tetap terbaca di light).
+Color mut(double o) => _night
+    ? Colors.white.withOpacity(o)
+    : const Color(0xFF12121A).withOpacity(o.clamp(0.0, 1.0) * 0.9 + 0.05);
 Color glow(Color c, double o) => c.withOpacity(o);
 
 // ============================================================
@@ -42,19 +52,22 @@ class WelcomeSahrulApp extends StatelessWidget {
   const WelcomeSahrulApp({super.key});
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Welcome Sahrul',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        useMaterial3: true,
-        scaffoldBackgroundColor: kBg,
-        fontFamily: 'sans-serif',
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: kCyan,
-          brightness: Brightness.dark,
+    return ValueListenableBuilder<bool>(
+      valueListenable: isNightNotifier,
+      builder: (_, night, __) => MaterialApp(
+        title: 'Welcome Sahrul',
+        debugShowCheckedModeBanner: false,
+        theme: ThemeData(
+          useMaterial3: true,
+          scaffoldBackgroundColor: kBg,
+          fontFamily: 'sans-serif',
+          colorScheme: ColorScheme.fromSeed(
+            seedColor: kCyan,
+            brightness: night ? Brightness.dark : Brightness.light,
+          ),
         ),
+        home: const SplashScreen(),
       ),
-      home: const SplashScreen(),
     );
   }
 }
@@ -130,7 +143,7 @@ class _SplashScreenState extends State<SplashScreen>
             const SizedBox(height: 24),
             FadeTransition(
               opacity: _c,
-              child: const Text('Welcome Sahrul',
+              child: Text('Welcome Sahrul',
                   style: TextStyle(
                       color: kWhite,
                       fontSize: 24,
@@ -173,7 +186,7 @@ class _RootShellState extends State<RootShell> {
       backgroundColor: kBg,
       body: SafeArea(bottom: false, child: _pages[_idx]),
       bottomNavigationBar: Container(
-        decoration: const BoxDecoration(
+        decoration: BoxDecoration(
           color: kPanel,
           border: Border(top: BorderSide(color: kBorder, width: 1)),
         ),
@@ -342,6 +355,34 @@ class RootService {
       am force-stop \$pkg 2>/dev/null
     done
     echo OK''');
+
+  // ===== UTILITAS TOOLS TAMBAHAN =====
+  // Flush DNS: bersihkan cache resolver agar koneksi memakai DNS terbaru.
+  static Future<String> flushDns() => run('''
+    ndc resolver flushdefaultif 2>/dev/null
+    ndc resolver flushnet 0 2>/dev/null
+    setprop net.dns.cache.flush 1 2>/dev/null
+    echo OK''');
+
+  // Refresh sinyal: toggle airplane mode cepat (off->on->off) supaya modem
+  // mencari ulang jaringan. Aman, memakai cmd connectivity / settings.
+  static Future<String> refreshSignal() => run('''
+    settings put global airplane_mode_on 1 2>/dev/null
+    am broadcast -a android.intent.action.AIRPLANE_MODE --ez state true 2>/dev/null
+    cmd connectivity airplane-mode enable 2>/dev/null
+    sleep 2
+    settings put global airplane_mode_on 0 2>/dev/null
+    am broadcast -a android.intent.action.AIRPLANE_MODE --ez state false 2>/dev/null
+    cmd connectivity airplane-mode disable 2>/dev/null
+    echo OK''');
+
+  // Bersihkan cache semua aplikasi (lega penyimpanan).
+  static Future<String> trimCaches() =>
+      run('pm trim-caches 999999999999 2>/dev/null; echo OK');
+
+  // Reset statistik baterai (kalibrasi penghitungan, bukan kapasitas fisik).
+  static Future<String> resetBatteryStats() =>
+      run('dumpsys batterystats --reset 2>/dev/null; echo OK');
 
   static Future<Map<String, String>> ram() async {
     try {
@@ -518,6 +559,7 @@ fi
     settings put system double_tap_to_wake 1 2>/dev/null
     settings put secure double_tap_to_wake 1 2>/dev/null
     settings put secure gesture_double_tap_to_wake 1 2>/dev/null
+    settings put global welcome_sahrul_dtw_pref 1 2>/dev/null
     RESULT=\$(settings get system os_action_tapping_wake 2>/dev/null)
     if [ "\$RESULT" = "1" ]; then echo OK; else echo "FAIL:\$RESULT"; fi''');
 
@@ -526,6 +568,7 @@ fi
     settings put system double_tap_to_wake 0 2>/dev/null
     settings put secure double_tap_to_wake 0 2>/dev/null
     settings put secure gesture_double_tap_to_wake 0 2>/dev/null
+    settings put global welcome_sahrul_dtw_pref 0 2>/dev/null
     echo OK''');
 
   // Status dibaca dari key Transsion yang benar.
@@ -533,6 +576,28 @@ fi
     final r = await run('settings get system os_action_tapping_wake');
     if (!bad(r) && r.trim() == '1') return '1';
     return '0';
+  }
+
+  // AUTO RE-APPLY:
+  // Masalah "ke-disable sendiri setelah hemat daya + reboot" terjadi karena
+  // sistem/penghemat baterai me-reset os_action_tapping_wake ke 0 saat boot.
+  // App menyimpan PREFERENSI user di key `welcome_sahrul_dtw_pref` (key custom
+  // milik app, tidak diutak-atik sistem). Saat app dibuka, kalau preferensi
+  // user = 1 TAPI setting aktual sudah ke-reset jadi 0, app menulis ulang
+  // otomatis — jadi user tidak perlu mengaktifkan manual tiap habis reboot.
+  static Future<void> reapplyDoubleTapWakeIfNeeded() async {
+    try {
+      final pref = await run('settings get global welcome_sahrul_dtw_pref');
+      if (bad(pref) || pref.trim() != '1') return; // user belum pernah aktifkan
+      final actual = await run('settings get system os_action_tapping_wake');
+      if (actual.trim() != '1') {
+        // ke-reset oleh sistem — pulihkan
+        await run(
+            'settings put system os_action_tapping_wake 1 2>/dev/null; echo OK');
+      }
+    } catch (_) {
+      // diam saja; ini best-effort, tidak boleh bikin app gagal start
+    }
   }
 
   // Key Transsion ini SELALU tersedia di Infinix/Tecno, jadi fitur dianggap
@@ -730,6 +795,9 @@ class _DashboardTabState extends State<DashboardTab> {
     super.initState();
     loadDevice();
     startPolling();
+    // Pulihkan otomatis "Ketuk 2x untuk Bangun" jika sebelumnya diaktifkan
+    // user tapi ke-reset sistem (mis. setelah hemat daya + reboot).
+    RootService.reapplyDoubleTapWakeIfNeeded();
   }
 
   @override
@@ -794,7 +862,7 @@ class _DashboardTabState extends State<DashboardTab> {
     return Container(
       padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
-        gradient: const LinearGradient(
+        gradient: LinearGradient(
             colors: [kPanel, kPanel2],
             begin: Alignment.topLeft,
             end: Alignment.bottomRight),
@@ -821,7 +889,7 @@ class _DashboardTabState extends State<DashboardTab> {
             builder: (_, d, __) => Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('Welcome Sahrul',
+                Text('Welcome Sahrul',
                     style: TextStyle(
                         fontSize: 19,
                         fontWeight: FontWeight.w800,
@@ -835,6 +903,8 @@ class _DashboardTabState extends State<DashboardTab> {
             ),
           ),
         ),
+        themeToggleButton(),
+        const SizedBox(width: 8),
         ValueListenableBuilder<bool>(
           valueListenable: busyNotifier,
           builder: (_, busy, __) => busy
@@ -988,13 +1058,8 @@ class _TweakTabState extends State<TweakTab> {
         return ListView(
           padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
           children: [
-            const Text('Tweak Performa',
-                style: TextStyle(
-                    fontSize: 22,
-                    fontWeight: FontWeight.w800,
-                    color: kWhite)),
-            Text('Atur perilaku perangkat sesuai kebutuhanmu',
-                style: TextStyle(fontSize: 12.5, color: mut(.45))),
+            pageTitleRow(
+                'Tweak Performa', 'Atur perilaku perangkat sesuai kebutuhanmu'),
             const SizedBox(height: 24),
 
             _sectionTitle('REFRESH RATE', kPurple),
@@ -1077,7 +1142,7 @@ class _TweakTabState extends State<TweakTab> {
             child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text('Disable Thermal (Total)',
+                  Text('Disable Thermal (Total)',
                       style: TextStyle(
                           color: kWhite,
                           fontSize: 14,
@@ -1148,9 +1213,9 @@ class _TweakTabState extends State<TweakTab> {
       builder: (ctx) => AlertDialog(
         backgroundColor: kPanel,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: Row(children: const [
-          Icon(Icons.warning_amber_rounded, color: kRed, size: 22),
-          SizedBox(width: 8),
+        title: Row(children: [
+          const Icon(Icons.warning_amber_rounded, color: kRed, size: 22),
+          const SizedBox(width: 8),
           Text('Peringatan', style: TextStyle(color: kWhite, fontSize: 17)),
         ]),
         content: Text(
@@ -1265,7 +1330,7 @@ class _TweakTabState extends State<TweakTab> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('Mode Performa CPU',
+                Text('Mode Performa CPU',
                     style: TextStyle(
                         color: kWhite,
                         fontSize: 14,
@@ -1338,11 +1403,7 @@ class ToolsTab extends StatelessWidget {
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
       children: [
-        const Text('Tools',
-            style: TextStyle(
-                fontSize: 22, fontWeight: FontWeight.w800, color: kWhite)),
-        Text('Utilitas & informasi perangkat',
-            style: TextStyle(fontSize: 12.5, color: mut(.45))),
+        pageTitleRow('Tools', 'Utilitas & informasi perangkat'),
         const SizedBox(height: 24),
         _sectionTitle('INFORMASI CHIPSET', kCyan),
         const SizedBox(height: 12),
@@ -1384,6 +1445,56 @@ class ToolsTab extends StatelessWidget {
             'Hentikan app berjalan di background', kPurple, () {
           runAction(RootService.clearRam, ok: '✅ Aplikasi latar dihentikan');
         }),
+        const SizedBox(height: 22),
+        _sectionTitle('JARINGAN & SISTEM', kTeal),
+        const SizedBox(height: 12),
+        _toolTile(Icons.dns_rounded, 'Flush DNS Cache',
+            'Bersihkan cache DNS untuk koneksi lebih segar', kTeal, () {
+          runAction(RootService.flushDns, ok: '✅ DNS cache dibersihkan');
+        }),
+        const SizedBox(height: 10),
+        _toolTile(Icons.airplanemode_active_rounded, 'Refresh Sinyal',
+            'Toggle airplane mode cepat untuk cari sinyal', kCyan, () {
+          runAction(RootService.refreshSignal,
+              ok: '✅ Sinyal di-refresh', noRoot: 'Butuh root aktif.');
+        }),
+        const SizedBox(height: 10),
+        _toolTile(Icons.delete_sweep_rounded, 'Bersihkan Cache Aplikasi',
+            'Hapus cache semua aplikasi untuk lega penyimpanan', kOrange, () {
+          runAction(RootService.trimCaches, ok: '✅ Cache aplikasi dibersihkan');
+        }),
+        const SizedBox(height: 10),
+        _toolTile(Icons.battery_saver_rounded, 'Kalibrasi Baterai',
+            'Reset statistik baterai (batterystats)', kGreen, () {
+          runAction(RootService.resetBatteryStats,
+              ok: '✅ Statistik baterai direset');
+        }),
+        const SizedBox(height: 22),
+        _sectionTitle('PINTASAN PENGATURAN', kPurple),
+        const SizedBox(height: 12),
+        _toolTile(Icons.display_settings_rounded, 'Pengaturan Layar',
+            'Buka pengaturan tampilan & refresh rate', kPurple, () {
+          runAction(
+              () => RootService.run(
+                  'am start -a android.settings.DISPLAY_SETTINGS && echo OK'),
+              ok: '✅ Membuka pengaturan layar');
+        }),
+        const SizedBox(height: 10),
+        _toolTile(Icons.apps_rounded, 'Info Aplikasi',
+            'Buka daftar & info semua aplikasi', kCyan, () {
+          runAction(
+              () => RootService.run(
+                  'am start -a android.settings.APPLICATION_SETTINGS && echo OK'),
+              ok: '✅ Membuka info aplikasi');
+        }),
+        const SizedBox(height: 10),
+        _toolTile(Icons.battery_charging_full_rounded, 'Pengaturan Baterai',
+            'Buka pengaturan & penghemat baterai', kGreen, () {
+          runAction(
+              () => RootService.run(
+                  'am start -a android.settings.BATTERY_SAVER_SETTINGS && echo OK'),
+              ok: '✅ Membuka pengaturan baterai');
+        }),
       ],
     );
   }
@@ -1398,7 +1509,7 @@ class ToolsTab extends StatelessWidget {
         Expanded(
           child: Text(v,
               textAlign: TextAlign.right,
-              style: const TextStyle(
+              style: TextStyle(
                   color: kWhite,
                   fontSize: 12.5,
                   fontWeight: FontWeight.w600,
@@ -1431,7 +1542,7 @@ class ToolsTab extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(title,
-                      style: const TextStyle(
+                      style: TextStyle(
                           color: kWhite,
                           fontSize: 14,
                           fontWeight: FontWeight.w600)),
@@ -1473,7 +1584,7 @@ class ToolsTab extends StatelessWidget {
               decoration: BoxDecoration(
                   color: mut(.2), borderRadius: BorderRadius.circular(2)),
             ),
-            const Text('Pilih Mode Reboot',
+            Text('Pilih Mode Reboot',
                 style: TextStyle(
                     color: kWhite, fontSize: 16, fontWeight: FontWeight.bold)),
             const SizedBox(height: 16),
@@ -1501,7 +1612,7 @@ class ToolsTab extends StatelessWidget {
         child: Icon(ic, color: c, size: 22),
       ),
       title: Text(label,
-          style: const TextStyle(
+          style: TextStyle(
               color: kWhite, fontWeight: FontWeight.w600, fontSize: 14)),
       subtitle:
           Text(desc, style: TextStyle(color: mut(.5), fontSize: 12)),
@@ -1513,7 +1624,7 @@ class ToolsTab extends StatelessWidget {
             backgroundColor: kPanel,
             shape:
                 RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-            title: const Text('Konfirmasi',
+            title: Text('Konfirmasi',
                 style: TextStyle(color: kWhite)),
             content: Text('Jalankan "$label"? Perangkat akan restart sekarang.',
                 style: TextStyle(color: mut(.7))),
@@ -1613,7 +1724,7 @@ class _DoubleTapWakeTileState extends State<_DoubleTapWakeTile> {
       subtitle = 'Tidak didukung (akses root nonaktif?)';
       subtitleColor = kYellow;
     } else if (on) {
-      subtitle = 'Aktif — ketuk 2x layar saat mati untuk bangun';
+      subtitle = 'Aktif — dipulihkan otomatis tiap buka app';
       subtitleColor = kGreen;
     } else {
       subtitle = 'Nonaktif — tekan untuk mengaktifkan';
@@ -1638,7 +1749,7 @@ class _DoubleTapWakeTileState extends State<_DoubleTapWakeTile> {
           const SizedBox(width: 14),
           Expanded(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              const Text('Ketuk 2x untuk Bangun',
+              Text('Ketuk 2x untuk Bangun',
                   style: TextStyle(
                       color: kWhite, fontSize: 14, fontWeight: FontWeight.w600)),
               const SizedBox(height: 3),
@@ -1682,6 +1793,7 @@ class AboutTab extends StatelessWidget {
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
       children: [
+        Align(alignment: Alignment.centerRight, child: themeToggleButton()),
         const SizedBox(height: 20),
         Center(
           child: Container(
@@ -1698,7 +1810,7 @@ class AboutTab extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 16),
-        const Center(
+        Center(
           child: Text('Welcome Sahrul',
               style: TextStyle(
                   fontSize: 22,
@@ -1762,7 +1874,7 @@ class AboutTab extends StatelessWidget {
         Expanded(
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Text(title,
-                style: const TextStyle(
+                style: TextStyle(
                     color: kWhite, fontSize: 14, fontWeight: FontWeight.w700)),
             const SizedBox(height: 4),
             Text(body,
@@ -1777,6 +1889,51 @@ class AboutTab extends StatelessWidget {
 // ============================================================
 // SHARED WIDGETS (top-level)
 // ============================================================
+
+// Tombol toggle Night/Light untuk pojok kanan atas tiap tab.
+Widget themeToggleButton() => ValueListenableBuilder<bool>(
+      valueListenable: isNightNotifier,
+      builder: (_, night, __) => GestureDetector(
+        onTap: () => isNightNotifier.value = !isNightNotifier.value,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+          decoration: BoxDecoration(
+            color: glow(night ? kPurple : kYellow, .12),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: glow(night ? kPurple : kYellow, .4)),
+          ),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            Icon(night ? Icons.dark_mode_rounded : Icons.light_mode_rounded,
+                size: 16, color: night ? kPurple : kYellow),
+            const SizedBox(width: 6),
+            Text(night ? 'Night' : 'Light',
+                style: TextStyle(
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w700,
+                    color: night ? kPurple : kYellow)),
+          ]),
+        ),
+      ),
+    );
+
+// Baris judul halaman + tombol Night/Light di kanan.
+Widget pageTitleRow(String title, String subtitle) => Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(title,
+                style: TextStyle(
+                    fontSize: 22, fontWeight: FontWeight.w800, color: kWhite)),
+            Text(subtitle, style: TextStyle(fontSize: 12.5, color: mut(.45))),
+          ]),
+        ),
+        const SizedBox(width: 12),
+        themeToggleButton(),
+      ],
+    );
+
 Widget _sectionTitle(String t, Color accent) => Row(children: [
       Container(
           width: 3,
@@ -1785,7 +1942,7 @@ Widget _sectionTitle(String t, Color accent) => Row(children: [
               color: accent, borderRadius: BorderRadius.circular(2))),
       const SizedBox(width: 8),
       Text(t,
-          style: const TextStyle(
+          style: TextStyle(
               color: kWhite,
               fontSize: 13,
               fontWeight: FontWeight.w700,
@@ -1881,7 +2038,7 @@ Widget _controlCard(IconData ic, String title, String sub, String btnLabel,
         Expanded(
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Text(title,
-                style: const TextStyle(
+                style: TextStyle(
                     color: kWhite,
                     fontSize: 14,
                     fontWeight: FontWeight.w600)),
