@@ -500,31 +500,78 @@ fi
       run('input keyevent 26 && echo OK');
 
   // ===== DOUBLE TAP TO WAKE =====
-  // Beberapa vendor (termasuk Infinix/Transsion-XOS) suka menonaktifkan
-  // sendiri opsi "double tap to wake" secara otomatis (reset saat reboot,
-  // update sistem, atau optimasi baterai). Fungsi ini menulis ulang ke
-  // SEMUA key umum yang dipakai vendor berbeda sekaligus supaya
-  // pengaktifan lebih tahan terhadap reset otomatis tersebut.
+  // PERBAIKAN: di banyak device MediaTek (termasuk Helio P65 di Infinix
+  // GT 20 Pro), "Settings.Secure/System" untuk double_tap_to_wake HANYA
+  // menyimpan nilai di database — sensor gesture sendiri tidak pernah
+  // dikabari karena driver membaca dari NODE SYSFS terpisah, bukan dari
+  // settings provider. Inilah sebabnya versi sebelumnya tidak berefek
+  // sama sekali walau "berhasil" menulis settings.
+  //
+  // Fungsi ini sekarang menulis ke SEMUA kemungkinan lapisan sekaligus:
+  //  1. Node sysfs gesture driver MediaTek/umum (paling menentukan)
+  //  2. Settings provider (untuk UI sistem yang membaca dari sana)
+  //  3. setprop persist (beberapa ROM membaca dari sini saat boot)
   static Future<String> enableDoubleTapWake() => run('''
+    FOUND=0
+    for NODE in \
+      /proc/tpd/gesture_switch \
+      /proc/tpd \
+      /sys/class/gesture/gesture/enable \
+      /sys/class/touch/touch_dev/double_tap \
+      /sys/class/sensors/dt_gesture/enable \
+      /sys/devices/virtual/touchscreen/touchscreen_gesture/enable \
+      /sys/touchscreen/dt2w \
+      /sys/devices/virtual/misc/touch/double_tap; do
+      if [ -e "\$NODE" ]; then
+        echo 1 > "\$NODE" 2>/dev/null && FOUND=1
+      fi
+    done
     settings put secure double_tap_to_wake 1 2>/dev/null
     settings put system double_tap_to_wake 1 2>/dev/null
     settings put global double_tap_to_wake 1 2>/dev/null
     settings put secure gesture_double_tap_to_wake 1 2>/dev/null
     settings put system gesture_double_tap_to_wake 1 2>/dev/null
     setprop persist.sys.gesture.dt2w 1 2>/dev/null
-    echo OK''');
+    setprop persist.vendor.gesture.dt2w 1 2>/dev/null
+    if [ "\$FOUND" = "1" ]; then echo OK; else echo "OK_NOSYSFS"; fi''');
 
   static Future<String> disableDoubleTapWake() => run('''
+    for NODE in \
+      /proc/tpd/gesture_switch \
+      /sys/class/gesture/gesture/enable \
+      /sys/class/touch/touch_dev/double_tap \
+      /sys/class/sensors/dt_gesture/enable \
+      /sys/devices/virtual/touchscreen/touchscreen_gesture/enable \
+      /sys/touchscreen/dt2w \
+      /sys/devices/virtual/misc/touch/double_tap; do
+      [ -e "\$NODE" ] && echo 0 > "\$NODE" 2>/dev/null
+    done
     settings put secure double_tap_to_wake 0 2>/dev/null
     settings put system double_tap_to_wake 0 2>/dev/null
     settings put global double_tap_to_wake 0 2>/dev/null
     settings put secure gesture_double_tap_to_wake 0 2>/dev/null
     settings put system gesture_double_tap_to_wake 0 2>/dev/null
     setprop persist.sys.gesture.dt2w 0 2>/dev/null
+    setprop persist.vendor.gesture.dt2w 0 2>/dev/null
     echo OK''');
 
-  // Cek status — coba beberapa key karena beda vendor pakai key berbeda.
+  // Cek status — utamakan node sysfs (sumber kebenaran sebenarnya di
+  // kernel), baru fallback ke settings provider kalau node tidak ada.
   static Future<String> doubleTapWakeStatus() async {
+    final nodes = [
+      '/proc/tpd/gesture_switch',
+      '/sys/class/gesture/gesture/enable',
+      '/sys/class/touch/touch_dev/double_tap',
+      '/sys/class/sensors/dt_gesture/enable',
+      '/sys/devices/virtual/touchscreen/touchscreen_gesture/enable',
+      '/sys/touchscreen/dt2w',
+      '/sys/devices/virtual/misc/touch/double_tap',
+    ];
+    for (final n in nodes) {
+      final r = await run('[ -e "$n" ] && cat "$n" 2>/dev/null');
+      if (!bad(r) && r.trim() == '1') return '1';
+      if (!bad(r) && r.trim() == '0') return '0';
+    }
     final keys = [
       'settings get secure double_tap_to_wake',
       'settings get system double_tap_to_wake',
@@ -536,6 +583,27 @@ fi
       if (!bad(r) && r.trim() == '1') return '1';
     }
     return '0';
+  }
+
+  // Cek apakah ada node sysfs yang terdeteksi sama sekali. Kalau tidak
+  // ada satupun, kemungkinan besar device ini mengontrol gesture lewat
+  // jalur tertutup vendor (HAL biner) yang tidak bisa diakses dari shell
+  // root biasa — UI perlu memberi tahu user soal ini secara jujur.
+  static Future<bool> doubleTapWakeNodeExists() async {
+    final nodes = [
+      '/proc/tpd/gesture_switch',
+      '/sys/class/gesture/gesture/enable',
+      '/sys/class/touch/touch_dev/double_tap',
+      '/sys/class/sensors/dt_gesture/enable',
+      '/sys/devices/virtual/touchscreen/touchscreen_gesture/enable',
+      '/sys/touchscreen/dt2w',
+      '/sys/devices/virtual/misc/touch/double_tap',
+    ];
+    for (final n in nodes) {
+      final r = await run('[ -e "$n" ] && echo FOUND');
+      if (!bad(r) && r.trim() == 'FOUND') return true;
+    }
+    return false;
   }
 
   // ===== DISABLE THERMAL TOTAL =====
@@ -766,6 +834,19 @@ class _DashboardTabState extends State<DashboardTab> {
           _sectionTitle('AKSI CEPAT', kGreen),
           const SizedBox(height: 12),
           _quickActions(),
+          const SizedBox(height: 24),
+          _sectionTitle('LAYAR & GESTURE', kTeal),
+          const SizedBox(height: 12),
+          _controlCard(
+            Icons.power_settings_new_rounded,
+            'Matikan Layar',
+            'Sama seperti menekan tombol power',
+            'Matikan',
+            kTeal,
+            () => runAction(RootService.screenOff, ok: '✅ Layar dimatikan'),
+          ),
+          const SizedBox(height: 10),
+          const _DoubleTapWakeTile(),
         ],
       ),
     );
@@ -1353,15 +1434,6 @@ class ToolsTab extends StatelessWidget {
         const SizedBox(height: 12),
         _rebootCard(context),
         const SizedBox(height: 22),
-        _sectionTitle('LAYAR & GESTURE', kTeal),
-        const SizedBox(height: 12),
-        _toolTile(Icons.power_settings_new_rounded, 'Matikan Layar',
-            'Sama seperti menekan tombol power', kTeal, () {
-          runAction(RootService.screenOff, ok: '✅ Layar dimatikan');
-        }),
-        const SizedBox(height: 10),
-        const _DoubleTapWakeTile(),
-        const SizedBox(height: 22),
         _sectionTitle('LAINNYA', kGreen),
         const SizedBox(height: 12),
         _toolTile(Icons.developer_mode_rounded, 'Buka Pengaturan Developer',
@@ -1546,6 +1618,7 @@ class _DoubleTapWakeTile extends StatefulWidget {
 class _DoubleTapWakeTileState extends State<_DoubleTapWakeTile> {
   bool? _active;
   bool _loading = true;
+  bool _nodeExists = true; // optimis sampai terbukti tidak ada
 
   @override
   void initState() {
@@ -1554,8 +1627,15 @@ class _DoubleTapWakeTileState extends State<_DoubleTapWakeTile> {
   }
 
   Future<void> _refresh() async {
+    final exists = await RootService.doubleTapWakeNodeExists();
     final s = await RootService.doubleTapWakeStatus();
-    if (mounted) setState(() { _active = s == '1'; _loading = false; });
+    if (mounted) {
+      setState(() {
+        _nodeExists = exists;
+        _active = s == '1';
+        _loading = false;
+      });
+    }
   }
 
   Future<void> _toggle() async {
@@ -1569,6 +1649,14 @@ class _DoubleTapWakeTileState extends State<_DoubleTapWakeTile> {
       _showSnack(context, on
           ? '⚠️ Gagal mengaktifkan. Pastikan root aktif.'
           : '⚠️ Gagal menonaktifkan. Pastikan root aktif.');
+    } else if (res.trim() == 'OK_NOSYSFS') {
+      // Settings provider berhasil ditulis, tapi tidak ada satupun node
+      // sysfs gesture yang ditemukan di device ini. Artinya kontrol
+      // gesture kemungkinan ada di HAL biner tertutup vendor — jujur
+      // beritahu user supaya tidak bingung kalau gesture tetap mati.
+      _showSnack(context, on
+          ? '⚠️ Setting ditulis, tapi sensor gesture device ini tidak terjangkau dari root shell. Coba aktifkan juga lewat Pengaturan > Gestur.'
+          : '✅ Setting dinonaktifkan');
     } else {
       _showSnack(context, on
           ? '✅ Ketuk 2x untuk bangun diaktifkan'
@@ -1586,6 +1674,22 @@ class _DoubleTapWakeTileState extends State<_DoubleTapWakeTile> {
   @override
   Widget build(BuildContext context) {
     final on = _active == true;
+    String subtitle;
+    Color subtitleColor;
+    if (_loading) {
+      subtitle = 'Memeriksa status...';
+      subtitleColor = mut(.45);
+    } else if (!_nodeExists) {
+      subtitle = 'Sensor gesture tidak terjangkau dari root di HP ini';
+      subtitleColor = kYellow;
+    } else if (on) {
+      subtitle = 'Aktif — sering ter-disable sendiri di HP ini';
+      subtitleColor = kGreen;
+    } else {
+      subtitle = 'Nonaktif — tekan untuk mengaktifkan';
+      subtitleColor = mut(.5);
+    }
+
     return ValueListenableBuilder<bool>(
       valueListenable: busyNotifier,
       builder: (_, busy, __) => Container(
@@ -1608,16 +1712,7 @@ class _DoubleTapWakeTileState extends State<_DoubleTapWakeTile> {
                   style: TextStyle(
                       color: kWhite, fontSize: 14, fontWeight: FontWeight.w600)),
               const SizedBox(height: 3),
-              Text(
-                _loading
-                    ? 'Memeriksa status...'
-                    : (on
-                        ? 'Aktif — sering ter-disable sendiri di HP ini'
-                        : 'Nonaktif — tekan untuk mengaktifkan'),
-                style: TextStyle(
-                    color: _loading ? mut(.45) : (on ? kGreen : mut(.5)),
-                    fontSize: 11.5),
-              ),
+              Text(subtitle, style: TextStyle(color: subtitleColor, fontSize: 11.5)),
             ]),
           ),
           const SizedBox(width: 10),
