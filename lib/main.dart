@@ -382,7 +382,35 @@ class RootService {
             'echo $g > /sys/devices/system/cpu/cpu$i/cpufreq/scaling_governor 2>/dev/null')
         .join('\n');
 
-    // Bagian frekuensi: hanya untuk performance kita paksa min=max.
+    // ===== KHUSUS MEDIATEK (Dimensity) =====
+    // MediaTek punya lapisan PPM (Power & Performance Management) yang diam-diam
+    // menurunkan clock meski cpufreq sudah di-set performance. Untuk benar-benar
+    // lock maksimal, PPM harus dimatikan dulu (untuk performance), lalu tiap
+    // cluster dikunci ke max-nya MASING-MASING (prime 3.1GHz, big 3.0GHz,
+    // little 2.0GHz) — bukan disamakan ke cpu0 yang cuma cluster little 2GHz.
+    String mtkPart;
+    if (g == 'performance') {
+      mtkPart = '''
+        # Matikan semua PPM policy (disable power-saving yang menurunkan clock)
+        if [ -f /proc/ppm/policy_status ]; then
+          NUM=\$(grep -c "" /proc/ppm/policy_status 2>/dev/null)
+          i=0
+          while [ \$i -lt 20 ]; do echo "\$i 0" > /proc/ppm/policy_status 2>/dev/null; i=\$((i+1)); done
+        fi
+        # Mode performa MediaTek (1 = performance, 0 = normal)
+        echo 1 > /proc/cpufreq/cpufreq_power_mode 2>/dev/null
+        # Nonaktifkan thermal throttle limiter MediaTek (sementara) bila ada
+        echo 0 > /proc/ppm/enabled 2>/dev/null
+      ''';
+    } else {
+      mtkPart = '''
+        # Kembalikan PPM & power mode ke normal
+        echo 0 > /proc/cpufreq/cpufreq_power_mode 2>/dev/null
+        echo 1 > /proc/ppm/enabled 2>/dev/null
+      ''';
+    }
+
+    // Bagian frekuensi: tiap policy dikunci ke max/min cluster-nya sendiri.
     String freqPart;
     if (g == 'performance') {
       freqPart = '''
@@ -390,8 +418,10 @@ class RootService {
           [ -d "\$P" ] || continue
           echo performance > "\$P/scaling_governor" 2>/dev/null
           MAXF=\$(cat "\$P/cpuinfo_max_freq" 2>/dev/null)
-          [ -n "\$MAXF" ] && echo "\$MAXF" > "\$P/scaling_min_freq" 2>/dev/null
-          [ -n "\$MAXF" ] && echo "\$MAXF" > "\$P/scaling_max_freq" 2>/dev/null
+          if [ -n "\$MAXF" ]; then
+            echo "\$MAXF" > "\$P/scaling_max_freq" 2>/dev/null
+            echo "\$MAXF" > "\$P/scaling_min_freq" 2>/dev/null
+          fi
         done''';
     } else {
       freqPart = '''
@@ -400,12 +430,13 @@ class RootService {
           echo $g > "\$P/scaling_governor" 2>/dev/null
           MINF=\$(cat "\$P/cpuinfo_min_freq" 2>/dev/null)
           MAXF=\$(cat "\$P/cpuinfo_max_freq" 2>/dev/null)
-          [ -n "\$MINF" ] && echo "\$MINF" > "\$P/scaling_min_freq" 2>/dev/null
           [ -n "\$MAXF" ] && echo "\$MAXF" > "\$P/scaling_max_freq" 2>/dev/null
+          [ -n "\$MINF" ] && echo "\$MINF" > "\$P/scaling_min_freq" 2>/dev/null
         done''';
     }
 
     return run('''
+$mtkPart
 $freqPart
 $perCpu
 RESULT=\$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)
@@ -415,8 +446,37 @@ if [ "\$RESULT" = "$g" ]; then echo OK; else echo "FAIL:\$RESULT"; fi
 
   static Future<String> gov() =>
       run('cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor');
-  static Future<String> freq() => run(
-      "cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq | awk '{printf \"%.0f MHz\", \$1/1000}'");
+
+  // Baca clock TERTINGGI dari semua core (bukan cuma cpu0 yang cluster little
+  // 2GHz). Ini yang sebelumnya bikin tampilan mentok di 2000 MHz.
+  static Future<String> freq() => run('''
+    MAX=0
+    for C in /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq; do
+      [ -f "\$C" ] || continue
+      F=\$(cat "\$C" 2>/dev/null)
+      [ -n "\$F" ] && [ "\$F" -gt "\$MAX" ] && MAX=\$F
+    done
+    if [ "\$MAX" -gt 0 ]; then
+      awk "BEGIN{printf \\"%.0f MHz\\", \$MAX/1000}"
+    else
+      echo NO_ROOT
+    fi
+  ''');
+
+  // Frekuensi maksimum tertinggi yang didukung perangkat (untuk info).
+  static Future<String> maxFreq() => run('''
+    MAX=0
+    for C in /sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq; do
+      [ -f "\$C" ] || continue
+      F=\$(cat "\$C" 2>/dev/null)
+      [ -n "\$F" ] && [ "\$F" -gt "\$MAX" ] && MAX=\$F
+    done
+    if [ "\$MAX" -gt 0 ]; then
+      awk "BEGIN{printf \\"%.0f MHz\\", \$MAX/1000}"
+    else
+      echo NO_ROOT
+    fi
+  ''');
 
   static Future<String> lockBand() => run('''
     echo "524288" > /data/local/tmp/bandlock.conf
@@ -434,6 +494,42 @@ if [ "\$RESULT" = "$g" ]; then echo OK; else echo "FAIL:\$RESULT"; fi
   static Future<String> thermalNormal() =>
       run('setprop persist.thermal.config default && echo OK');
   static Future<String> thermal() => run('getprop persist.thermal.config');
+
+  // ===== DISABLE THERMAL TOTAL =====
+  // Mematikan semua thermal throttling: thermal-engine service (MediaTek/QCOM),
+  // mtk_thermal, dan node thermal_zone mode. Disimpan flag agar UI tahu status.
+  // PERINGATAN: menghilangkan proteksi panas — dipakai dengan risiko sendiri.
+  static Future<String> disableThermal() => run('''
+    # Hentikan service thermal-engine (nama beda tiap vendor)
+    stop thermal-engine 2>/dev/null
+    stop vendor.thermal-engine 2>/dev/null
+    stop mtk_thermal 2>/dev/null
+    setprop persist.vendor.disable.thermal.control 1 2>/dev/null
+    setprop persist.thermal.config disabled 2>/dev/null
+    # Set semua thermal_zone ke mode disabled
+    for Z in /sys/class/thermal/thermal_zone*; do
+      [ -f "\$Z/mode" ] && echo disabled > "\$Z/mode" 2>/dev/null
+    done
+    # MediaTek: matikan thermal policy
+    echo 0 > /proc/mtk_thermal/mtktscpu/mtktscpu_dump 2>/dev/null
+    echo 0 > /sys/kernel/thermal/mode 2>/dev/null
+    echo OK''');
+
+  static Future<String> enableThermal() => run('''
+    # Aktifkan kembali proteksi thermal
+    start thermal-engine 2>/dev/null
+    start vendor.thermal-engine 2>/dev/null
+    start mtk_thermal 2>/dev/null
+    setprop persist.vendor.disable.thermal.control 0 2>/dev/null
+    setprop persist.thermal.config default 2>/dev/null
+    for Z in /sys/class/thermal/thermal_zone*; do
+      [ -f "\$Z/mode" ] && echo enabled > "\$Z/mode" 2>/dev/null
+    done
+    echo 1 > /sys/kernel/thermal/mode 2>/dev/null
+    echo OK''');
+
+  static Future<String> thermalDisabledStatus() =>
+      run('getprop persist.vendor.disable.thermal.control');
 
   static Future<String> rebootSystem() => run('reboot');
   static Future<String> rebootRecovery() => run('reboot recovery');
@@ -476,17 +572,21 @@ if [ "\$RESULT" = "$g" ]; then echo OK; else echo "FAIL:\$RESULT"; fi
       final b = await battery();
       final tp = await temp();
       final fq = await freq();
+      final mfq = await maxFreq();
       final gv = await gov();
       final rr = await currentRefresh();
       final th = await thermal();
+      final tdis = await thermalDisabledStatus();
       final bn = await bandStatus();
       return {
         'battery': bad(b) ? '-' : '$b%',
         'temp': bad(tp) ? '-' : tp,
         'freq': bad(fq) ? '-' : fq,
+        'max_freq': bad(mfq) ? '-' : mfq,
         'gov': bad(gv) ? '-' : gv,
         'refresh': bad(rr) ? '-' : '${rr}Hz',
         'thermal': bad(th) ? 'default' : th,
+        'thermal_disabled': tdis.trim() == '1' ? 'true' : 'false',
         'band': bn == '524288' ? 'B1+B3+B8' : 'Auto',
         'root': 'true',
       };
@@ -869,9 +969,146 @@ class _TweakTabState extends State<TweakTab> {
                 noRoot: 'Thermal profile ini tak didukung ROM kamu.',
               ),
             ),
+            const SizedBox(height: 12),
+            _buildDisableThermalCard(context, sys),
           ],
         );
       },
+    );
+  }
+
+  Widget _buildDisableThermalCard(
+      BuildContext context, Map<String, String> sys) {
+    final off = sys['thermal_disabled'] == 'true';
+    final tempStr = (sys['temp'] ?? '').replaceAll('°C', '');
+    final tempVal = double.tryParse(tempStr) ?? 0;
+    final hot = tempVal >= 48;
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: kPanel,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(
+            color: off ? kRed : kBorder, width: off ? 1.5 : 1),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Container(
+            padding: const EdgeInsets.all(11),
+            decoration: BoxDecoration(
+                color: glow(kRed, .1),
+                borderRadius: BorderRadius.circular(13)),
+            child: const Icon(Icons.local_fire_department_rounded,
+                color: kRed, size: 22),
+          ),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Disable Thermal (Total)',
+                      style: TextStyle(
+                          color: kWhite,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600)),
+                  const SizedBox(height: 3),
+                  Text(
+                      off
+                          ? '🔴 Proteksi panas DIMATIKAN'
+                          : 'Lepas semua batas suhu (berisiko)',
+                      style: TextStyle(
+                          color: off ? kRed : mut(.45), fontSize: 11.5)),
+                ]),
+          ),
+          const SizedBox(width: 10),
+          ElevatedButton(
+            onPressed: () {
+              if (off) {
+                runAction(RootService.enableThermal,
+                    ok: '✅ Proteksi thermal diaktifkan kembali');
+              } else {
+                _confirmDisableThermal(context);
+              }
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: off ? glow(kGreen, .15) : glow(kRed, .15),
+              foregroundColor: off ? kGreen : kRed,
+              side: BorderSide(color: off ? kGreen : kRed),
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(11)),
+              elevation: 0,
+            ),
+            child: Text(off ? 'Aktifkan' : 'Matikan',
+                style: const TextStyle(
+                    fontSize: 11.5, fontWeight: FontWeight.bold)),
+          ),
+        ]),
+        if (off && hot) ...[
+          const SizedBox(height: 12),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(11),
+            decoration: BoxDecoration(
+              color: glow(kRed, .12),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: glow(kRed, .5)),
+            ),
+            child: Row(children: [
+              const Icon(Icons.warning_amber_rounded, color: kRed, size: 16),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                    'Suhu ${sys['temp']} — sudah panas! Sebaiknya aktifkan kembali thermal.',
+                    style: const TextStyle(
+                        color: kRed, fontSize: 11.5, height: 1.3)),
+              ),
+            ]),
+          ),
+        ],
+      ]),
+    );
+  }
+
+  void _confirmDisableThermal(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: kPanel,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(children: const [
+          Icon(Icons.warning_amber_rounded, color: kRed, size: 22),
+          SizedBox(width: 8),
+          Text('Peringatan', style: TextStyle(color: kWhite, fontSize: 17)),
+        ]),
+        content: Text(
+          'Mematikan thermal akan menghilangkan SEMUA proteksi panas perangkat.\n\n'
+          'Risiko: HP cepat panas, baterai bisa rusak/menggembung, dan komponen '
+          'bisa rusak permanen jika dibiarkan terlalu lama.\n\n'
+          'Gunakan hanya sebentar saat gaming, dan aktifkan kembali setelahnya. '
+          'Lanjutkan?',
+          style: TextStyle(color: mut(.7), fontSize: 13, height: 1.4),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Batal'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+                backgroundColor: kRed, foregroundColor: Colors.white),
+            onPressed: () {
+              Navigator.pop(ctx);
+              runAction(RootService.disableThermal,
+                  ok: '🔴 Thermal dimatikan — pantau suhu!',
+                  noRoot: 'Tidak bisa mematikan thermal di ROM ini.');
+            },
+            child: const Text('Ya, Matikan'),
+          ),
+        ],
+      ),
     );
   }
 
@@ -1041,17 +1278,23 @@ class ToolsTab extends StatelessWidget {
         const SizedBox(height: 12),
         ValueListenableBuilder<Map<String, String>>(
           valueListenable: deviceNotifier,
-          builder: (_, d, __) => Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-                color: kPanel,
-                borderRadius: BorderRadius.circular(18),
-                border: Border.all(color: kBorder)),
-            child: Column(children: [
-              _infoRow('Perangkat', d['name'] ?? '-'),
-              _infoRow('Versi OS', d['android'] ?? '-'),
-              _infoRow('Chipset', d['chipset'] ?? '-'),
-            ]),
+          builder: (_, d, __) => ValueListenableBuilder<Map<String, String>>(
+            valueListenable: sysNotifier,
+            builder: (_, sys, __) => Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                  color: kPanel,
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(color: kBorder)),
+              child: Column(children: [
+                _infoRow('Perangkat', d['name'] ?? '-'),
+                _infoRow('Versi OS', d['android'] ?? '-'),
+                _infoRow('Chipset', d['chipset'] ?? '-'),
+                _infoRow('CPU Sekarang', sys['freq'] ?? '-'),
+                _infoRow('CPU Maksimum', sys['max_freq'] ?? '-'),
+                _infoRow('Governor', sys['gov'] ?? '-'),
+              ]),
+            ),
           ),
         ),
         const SizedBox(height: 22),
