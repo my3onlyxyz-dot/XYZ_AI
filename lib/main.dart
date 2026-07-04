@@ -1173,10 +1173,15 @@ class DashStats {
     required this.tempText,
     required this.tempC,
     required this.batText,
+    required this.batPct,
+    required this.batStatus,
     required this.batTempText,
     required this.uptime,
     required this.memTotalMb,
     required this.memUsedMb,
+    required this.clusterLabels,
+    required this.clusterCurKhz,
+    required this.clusterMaxKhz,
     required this.freqHist,
     required this.tempHist,
     required this.memHist,
@@ -1184,16 +1189,24 @@ class DashStats {
   });
 
   final bool ready;
-  final String freqText, gov, tempText, batText, batTempText, uptime;
+  final String freqText, gov, tempText, batText, batStatus, batTempText, uptime;
   final double? tempC;
+  final int? batPct;
   final int memTotalMb, memUsedMb;
+
+  /// Data per-cluster (LITTLE/BIG/PRIME) — index sejajar antar list.
+  final List<String> clusterLabels;
+  final List<int> clusterCurKhz, clusterMaxKhz;
+
   final List<double> freqHist, tempHist, memHist, batHist;
 
   /// Kondisi awal sebelum sampel pertama masuk (skeleton tampil).
   static DashStats initial() => const DashStats(
       ready: false, freqText: '---', gov: '---', tempText: '---',
-      tempC: null, batText: '---', batTempText: '---', uptime: '---',
+      tempC: null, batText: '---', batPct: null, batStatus: '---',
+      batTempText: '---', uptime: '---',
       memTotalMb: 0, memUsedMb: 0,
+      clusterLabels: [], clusterCurKhz: [], clusterMaxKhz: [],
       freqHist: [], tempHist: [], memHist: [], batHist: []);
 
   /// Dipakai setelah 2x polling gagal total: tampilkan '---' alih-alih
@@ -1202,8 +1215,11 @@ class DashStats {
           List<double> b) =>
       DashStats(
           ready: true, freqText: '---', gov: '---', tempText: '---',
-          tempC: null, batText: '---', batTempText: '---', uptime: '---',
+          tempC: null, batText: '---', batPct: null, batStatus: '---',
+          batTempText: '---', uptime: '---',
           memTotalMb: 0, memUsedMb: 0,
+          clusterLabels: const [], clusterCurKhz: const [],
+          clusterMaxKhz: const [],
           freqHist: f, tempHist: t, memHist: m, batHist: b);
 }
 
@@ -1315,7 +1331,18 @@ class _DashboardTabState extends State<DashboardTab> {
         di.batteryTempPath != null                                    // n+5
             ? Sys.read(di.batteryTempPath!)
             : Future<String>.value(''),
+        Sys.read('/sys/class/power_supply/battery/status'),           // n+6
       ]);
+
+      // ── Per-cluster: label + frekuensi live + batas hardware ──
+      final cLabels = <String>[];
+      final cCur = <int>[];
+      final cMax = <int>[];
+      for (int i = 0; i < di.policies.length && i < nFreq; i++) {
+        cLabels.add(di.policies[i].label);
+        cMax.add(di.policies[i].hwMaxKhz);
+        cCur.add(int.tryParse(r[i]) ?? 0);
+      }
 
       // ── CPU: pakai frekuensi TERTINGGI antar cluster sebagai angka utama ──
       int khzMax = 0;
@@ -1362,6 +1389,7 @@ class _DashboardTabState extends State<DashboardTab> {
           : btRaw.abs() > 100
               ? '${(btRaw / 10).toStringAsFixed(1)}°C'
               : '$btRaw°C';
+      final batStatus = r[nFreq + 6].trim();
 
       final allDead = khzMax <= 0 && mtMb <= 0 && sec <= 0;
       if (allDead) {
@@ -1389,10 +1417,15 @@ class _DashboardTabState extends State<DashboardTab> {
         tempText: tempText,
         tempC: tempC,
         batText: batText,
+        batPct: batPct,
+        batStatus: batStatus.isEmpty ? '---' : batStatus,
         batTempText: batTempText,
         uptime: uptime,
         memTotalMb: mtMb,
         memUsedMb: usedMb,
+        clusterLabels: cLabels,
+        clusterCurKhz: cCur,
+        clusterMaxKhz: cMax,
         freqHist: _freqHist,
         tempHist: _tempHist,
         memHist: _memHist,
@@ -1403,6 +1436,21 @@ class _DashboardTabState extends State<DashboardTab> {
     } finally {
       _ticking = false;
     }
+  }
+
+  /// Aksi cepat dari kartu RAM — bebaskan cache tanpa pindah tab.
+  Future<void> _clearCache() async {
+    if (!isRootNotifier.value) {
+      showSnack(context, '⚠ Butuh akses root untuk membersihkan cache');
+      return;
+    }
+    HapticFeedback.mediumImpact();
+    final out = await Root.exec('sync; echo 3 > /proc/sys/vm/drop_caches');
+    if (!mounted) return;
+    final err = out.startsWith('ERR') || out == 'NO_ROOT';
+    showSnack(context,
+        err ? '✗ ${_stripErr(out)}' : '✓ Cache dibersihkan — RAM dibebaskan');
+    if (!err) _tick();
   }
 
   @override
@@ -1432,23 +1480,25 @@ class _DashboardTabState extends State<DashboardTab> {
               child: ValueListenableBuilder<DashStats>(
                 valueListenable: _stats,
                 builder: (_, s, __) {
-                  if (!s.ready) return const _Skeleton(226);
+                  if (!s.ready) {
+                    return const Column(children: [
+                      _Skeleton(198),
+                      SizedBox(height: 10),
+                      _Skeleton(108),
+                    ]);
+                  }
                   final tempColor = s.tempC == null
                       ? kBlue
                       : s.tempC! > 55
                           ? kRed
-                          : kGreen;
+                          : s.tempC! > 45
+                              ? kYellow
+                              : kGreen;
                   return Column(children: [
-                    Row(children: [
-                      Expanded(
-                          child: _StatTile('CPU Freq', s.freqText,
-                              Icons.speed_rounded, kCyan,
-                              history: s.freqHist)),
-                      const SizedBox(width: 10),
-                      Expanded(
-                          child: _StatTile('Governor', s.gov,
-                              Icons.tune_rounded, kPurple)),
-                    ]),
+                    // Kartu hero: frekuensi tertinggi + sparkline + bar live
+                    // per-cluster (LITTLE/BIG/PRIME), governor & suhu sebagai
+                    // pill — sekali lihat, semua kondisi CPU terbaca.
+                    _CpuHeroCard(s),
                     const SizedBox(height: 10),
                     Row(children: [
                       Expanded(
@@ -1471,8 +1521,11 @@ class _DashboardTabState extends State<DashboardTab> {
               child: ValueListenableBuilder<DashStats>(
                 valueListenable: _stats,
                 builder: (_, s, __) => s.ready
-                    ? _MemCard(totalMb: s.memTotalMb, usedMb: s.memUsedMb)
-                    : const _Skeleton(96),
+                    ? _MemCard(
+                        totalMb: s.memTotalMb,
+                        usedMb: s.memUsedMb,
+                        onClean: _clearCache)
+                    : const _Skeleton(110),
               ),
             ),
             const SizedBox(height: 18),
@@ -1481,18 +1534,8 @@ class _DashboardTabState extends State<DashboardTab> {
             RepaintBoundary(
               child: ValueListenableBuilder<DashStats>(
                 valueListenable: _stats,
-                builder: (_, s, __) => s.ready
-                    ? Row(children: [
-                        Expanded(
-                            child: _StatTile('Kapasitas', s.batText,
-                                Icons.battery_full_rounded, kGreen,
-                                history: s.batHist)),
-                        const SizedBox(width: 10),
-                        Expanded(
-                            child: _StatTile('Suhu', s.batTempText,
-                                Icons.device_thermostat_rounded, kOrange)),
-                      ])
-                    : const _Skeleton(108),
+                builder: (_, s, __) =>
+                    s.ready ? _BatteryCard(s) : const _Skeleton(108),
               ),
             ),
             const SizedBox(height: 24),
@@ -1642,8 +1685,9 @@ class _StatTile extends StatelessWidget {
 }
 
 class _MemCard extends StatelessWidget {
-  const _MemCard({required this.totalMb, required this.usedMb});
+  const _MemCard({required this.totalMb, required this.usedMb, this.onClean});
   final int totalMb, usedMb;
+  final VoidCallback? onClean;
 
   @override
   Widget build(BuildContext context) {
@@ -1675,22 +1719,335 @@ class _MemCard extends StatelessWidget {
         const SizedBox(height: 12),
         ClipRRect(
             borderRadius: BorderRadius.circular(6),
-            child: LinearProgressIndicator(
-                value: pct,
-                minHeight: 8,
-                backgroundColor: mut(.06),
-                valueColor: AlwaysStoppedAnimation(barColor))),
+            child: TweenAnimationBuilder<double>(
+                tween: Tween(end: pct),
+                duration: Motion.med,
+                curve: Motion.curve,
+                builder: (_, v, __) => LinearProgressIndicator(
+                    value: v,
+                    minHeight: 8,
+                    backgroundColor: mut(.06),
+                    valueColor: AlwaysStoppedAnimation(barColor)))),
         const SizedBox(height: 8),
         Row(children: [
           Text('Free: ${totalMb <= 0 ? '---' : '$freeMb MB'}',
               style: TextStyle(color: mut(.4), fontSize: 11)),
-          const Spacer(),
-          Text('${(pct * 100).toStringAsFixed(0)}% used',
+          const SizedBox(width: 8),
+          Text('· ${(pct * 100).toStringAsFixed(0)}% used',
               style: TextStyle(color: mut(.4), fontSize: 11)),
+          const Spacer(),
+          // Aksi cepat: drop caches langsung dari dashboard — tanpa
+          // pindah ke tab Command.
+          if (onClean != null)
+            Tap(
+              onTap: onClean!,
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                    color: kGreen.withOpacity(.12),
+                    borderRadius: BorderRadius.circular(9),
+                    border: Border.all(color: kGreen.withOpacity(.3))),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  Icon(Icons.cleaning_services_rounded,
+                      color: kGreen, size: 12),
+                  const SizedBox(width: 5),
+                  Text('Bersihkan',
+                      style: TextStyle(
+                          color: kGreen,
+                          fontSize: 10.5,
+                          fontWeight: FontWeight.w700)),
+                ]),
+              ),
+            ),
         ]),
       ]),
     );
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// CPU HERO — satu kartu untuk seluruh kondisi prosesor: frekuensi
+// tertinggi (angka besar + sparkline), governor & suhu sebagai pill,
+// dan bar frekuensi LIVE per-cluster. Data cluster sudah dibaca
+// per-policy oleh _tick — sebelumnya hanya nilai max yang ditampilkan.
+// ─────────────────────────────────────────────────────────────────────
+class _CpuHeroCard extends StatelessWidget {
+  const _CpuHeroCard(this.s);
+  final DashStats s;
+
+  Color _clusterColor(String label) => switch (label) {
+        'LITTLE' => kGreen,
+        'BIG' => kOrange,
+        'PRIME' => kRed,
+        _ => kCyan,
+      };
+
+  @override
+  Widget build(BuildContext context) {
+    final tempColor = s.tempC == null
+        ? kBlue
+        : s.tempC! > 55
+            ? kRed
+            : s.tempC! > 45
+                ? kYellow
+                : kGreen;
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+          color: kPanel,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: kCyan.withOpacity(.18))),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                  color: kCyan.withOpacity(.12),
+                  borderRadius: BorderRadius.circular(10)),
+              child: Icon(Icons.speed_rounded, color: kCyan, size: 16)),
+          const SizedBox(width: 9),
+          Text('CPU',
+              style: TextStyle(
+                  color: kWhite, fontSize: 13, fontWeight: FontWeight.w700)),
+          const Spacer(),
+          _pill(Icons.tune_rounded, s.gov, kPurple),
+          const SizedBox(width: 6),
+          _pill(Icons.thermostat_rounded, s.tempText, tempColor),
+        ]),
+        const SizedBox(height: 8),
+        // Angka utama + sparkline di lapisan belakang.
+        SizedBox(
+          height: 46,
+          child: Stack(children: [
+            if (s.freqHist.length >= 2)
+              Positioned.fill(
+                child: Align(
+                    alignment: Alignment.bottomCenter,
+                    child: SizedBox(
+                        height: 30,
+                        child: CustomPaint(
+                            painter: _SparklinePainter(s.freqHist, kCyan),
+                            size: Size.infinite))),
+              ),
+            Align(
+                alignment: Alignment.bottomLeft,
+                child: Text(s.freqText,
+                    style: TextStyle(
+                        color: kCyan,
+                        fontSize: 26,
+                        fontWeight: FontWeight.w800,
+                        fontFamily: 'monospace'))),
+          ]),
+        ),
+        Text('FREKUENSI TERTINGGI',
+            style: TextStyle(
+                color: mut(.35),
+                fontSize: 9,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.5)),
+        if (s.clusterLabels.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          for (int i = 0; i < s.clusterLabels.length; i++)
+            Padding(
+              padding: EdgeInsets.only(
+                  bottom: i == s.clusterLabels.length - 1 ? 0 : 8),
+              child: _clusterRow(i),
+            ),
+        ],
+      ]),
+    );
+  }
+
+  Widget _pill(IconData icon, String text, Color c) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        decoration: BoxDecoration(
+            color: c.withOpacity(.1),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: c.withOpacity(.25))),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          Icon(icon, color: c, size: 11),
+          const SizedBox(width: 4),
+          Text(text,
+              style: TextStyle(
+                  color: c,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w700,
+                  fontFamily: 'monospace')),
+        ]),
+      );
+
+  Widget _clusterRow(int i) {
+    final label = s.clusterLabels[i];
+    final cur = s.clusterCurKhz[i];
+    final max = s.clusterMaxKhz[i];
+    final pct = max <= 0 ? 0.0 : (cur / max).clamp(0.0, 1.0);
+    final c = _clusterColor(label);
+    final curTxt = cur <= 0 ? '--' : (cur / 1000000).toStringAsFixed(2);
+    final maxTxt = max <= 0 ? '--' : (max / 1000000).toStringAsFixed(1);
+    return Row(children: [
+      SizedBox(
+          width: 50,
+          child: Text(label,
+              style: TextStyle(
+                  color: mut(.45),
+                  fontSize: 9,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: .8,
+                  fontFamily: 'monospace'))),
+      Expanded(
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(4),
+          child: TweenAnimationBuilder<double>(
+              tween: Tween(end: pct),
+              duration: Motion.med,
+              curve: Motion.curve,
+              builder: (_, v, __) => LinearProgressIndicator(
+                  value: v,
+                  minHeight: 6,
+                  backgroundColor: mut(.06),
+                  valueColor: AlwaysStoppedAnimation(c.withOpacity(.85)))),
+        ),
+      ),
+      const SizedBox(width: 10),
+      SizedBox(
+          width: 84,
+          child: Text('$curTxt / $maxTxt GHz',
+              textAlign: TextAlign.right,
+              style: TextStyle(
+                  color: c.withOpacity(.9),
+                  fontSize: 9.5,
+                  fontWeight: FontWeight.w700,
+                  fontFamily: 'monospace'))),
+    ]);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// BATTERY — kapasitas + sparkline, suhu, dan status pengisian daya
+// (dibaca dari power_supply/battery/status) dalam SATU kartu.
+// ─────────────────────────────────────────────────────────────────────
+class _BatteryCard extends StatelessWidget {
+  const _BatteryCard(this.s);
+  final DashStats s;
+
+  @override
+  Widget build(BuildContext context) {
+    final charging = s.batStatus == 'Charging';
+    final full = s.batStatus == 'Full';
+    final low = s.batPct != null && s.batPct! <= 20 && !charging;
+    final c = low ? kRed : kGreen;
+    final statusTxt = charging
+        ? 'Mengisi daya'
+        : full
+            ? 'Penuh'
+            : s.batStatus == 'Discharging'
+                ? 'Memakai baterai'
+                : s.batStatus == 'Not charging'
+                    ? 'Tidak mengisi'
+                    : s.batStatus;
+    return Container(
+      height: 108,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+          color: kPanel,
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: c.withOpacity(.18))),
+      child: Row(children: [
+        // Kiri: kapasitas besar + sparkline.
+        Expanded(
+          child: Stack(children: [
+            if (s.batHist.length >= 2)
+              Positioned.fill(
+                child: Align(
+                    alignment: Alignment.bottomCenter,
+                    child: SizedBox(
+                        height: 24,
+                        child: CustomPaint(
+                            painter: _SparklinePainter(s.batHist, c),
+                            size: Size.infinite))),
+              ),
+            Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                      padding: const EdgeInsets.all(7),
+                      decoration: BoxDecoration(
+                          color: c.withOpacity(.12),
+                          borderRadius: BorderRadius.circular(9)),
+                      child: Icon(
+                          charging
+                              ? Icons.bolt_rounded
+                              : Icons.battery_full_rounded,
+                          color: c,
+                          size: 15)),
+                  const Spacer(),
+                  Text(s.batText,
+                      style: TextStyle(
+                          color: c,
+                          fontSize: 20,
+                          fontWeight: FontWeight.w800,
+                          fontFamily: 'monospace')),
+                  Text('KAPASITAS',
+                      style: TextStyle(
+                          color: mut(.35),
+                          fontSize: 8.5,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 1.2)),
+                ]),
+          ]),
+        ),
+        Container(
+            width: 1,
+            margin: const EdgeInsets.symmetric(horizontal: 14),
+            color: kBorder.withOpacity(.7)),
+        // Kanan: suhu + status pengisian.
+        Expanded(
+          child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                _mini(Icons.device_thermostat_rounded, kOrange, 'Suhu',
+                    s.batTempText),
+                const SizedBox(height: 12),
+                _mini(
+                    charging
+                        ? Icons.bolt_rounded
+                        : Icons.power_settings_new_rounded,
+                    charging ? kYellow : c,
+                    'Status',
+                    statusTxt),
+              ]),
+        ),
+      ]),
+    );
+  }
+
+  Widget _mini(IconData icon, Color c, String label, String value) =>
+      Row(children: [
+        Icon(icon, color: c, size: 14),
+        const SizedBox(width: 7),
+        Expanded(
+          child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(label,
+                    style: TextStyle(
+                        color: mut(.35),
+                        fontSize: 8.5,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 1)),
+                Text(value,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                        color: kWhite,
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w700,
+                        fontFamily: 'monospace')),
+              ]),
+        ),
+      ]);
 }
 
 /// Placeholder loading dengan tinggi eksplisit — layout tidak "loncat"
@@ -1807,164 +2164,42 @@ class CommandTab extends StatelessWidget {
                   const _RootStrip(),
                   const SizedBox(height: 14),
                   const _DeviceBanner(),
-                  const SizedBox(height: 12),
+                  const SizedBox(height: 18),
 
+                  // ── PERFORMA ────────────────────────────────────────
+                  _sectionLabel('PERFORMA', kCyan),
+                  const SizedBox(height: 10),
                   if (govGroup != null) govGroup,
                   if (freqGroup != null) freqGroup,
-
-                  // Grup ber-polling — masing-masing dgn TabGate sendiri.
                   const _RefreshRateGroup(),
-                  const _BandLockGroup(),
+                  _thermalGroup(),
 
-                  _CmdGroup(
-                      icon: Icons.memory_rounded,
-                      label: 'RAM & Cache',
-                      accent: kPurple,
-                      subtitle: 'Bersihkan memori',
-                      children: const [
-                        _CmdLeaf('Clear Cache', Icons.cleaning_services_rounded,
-                            kGreen, 'Bebaskan RAM cache',
-                            cmd: 'sync; echo 3 > /proc/sys/vm/drop_caches'),
-                        _CmdLeaf('Swappiness 10', Icons.swap_horiz_rounded,
-                            kBlue, 'Prioritaskan RAM',
-                            cmd: 'echo 10 > /proc/sys/vm/swappiness'),
-                        _CmdLeaf('Swappiness 60', Icons.swap_vert_rounded,
-                            kPurple, 'Seimbang (default)',
-                            cmd: 'echo 60 > /proc/sys/vm/swappiness'),
-                      ]),
+                  const SizedBox(height: 8),
+                  // ── JARINGAN ────────────────────────────────────────
+                  _sectionLabel('JARINGAN', kBlue),
+                  const SizedBox(height: 10),
+                  _bandLockGroup(),
+                  _dnsGroup(),
+                  _tcpGroup(),
 
-                  _CmdGroup(
-                      icon: Icons.thermostat_rounded,
-                      label: 'Thermal',
-                      accent: kRed,
-                      subtitle: 'Kontrol suhu & throttle',
-                      children: const [
-                        _CmdLeaf('Baca Suhu', Icons.thermostat_rounded, kCyan,
-                            'Semua zona + nama sensornya',
-                            cmd:
-                                'for z in /sys/class/thermal/thermal_zone*; do t=\$(cat "\$z/temp" 2>/dev/null); n=\$(cat "\$z/type" 2>/dev/null); [ -n "\$t" ] && echo "\${n:-\$z}: \$t"; done',
-                            readOnly: true),
-                        // Loop SEMUA zona (bukan cuma zone0) + flag ok agar
-                        // kegagalan total terlapor jelas sebagai ERR.
-                        _CmdLeaf('Disable Throttle', Icons.warning_rounded,
-                            kRed, 'Matikan throttle — pantau suhu!',
-                            cmd:
-                                'ok=0; for m in /sys/class/thermal/thermal_zone*/mode; do echo disabled > "\$m" 2>/dev/null && ok=1; done; [ \$ok -eq 1 ] && echo OK || echo "ERR: node mode tidak tersedia"',
-                            danger: true),
-                        _CmdLeaf('Enable Throttle', Icons.check_circle_rounded,
-                            kGreen, 'Aktifkan throttle kembali',
-                            cmd:
-                                'ok=0; for m in /sys/class/thermal/thermal_zone*/mode; do echo enabled > "\$m" 2>/dev/null && ok=1; done; [ \$ok -eq 1 ] && echo OK || echo "ERR: node mode tidak tersedia"'),
-                      ]),
+                  const SizedBox(height: 8),
+                  // ── MEMORI & STORAGE ────────────────────────────────
+                  _sectionLabel('MEMORI & STORAGE', kPurple),
+                  const SizedBox(height: 10),
+                  _swappinessGroup(),
+                  _ioGroup(),
 
-                  _CmdGroup(
-                      icon: Icons.storage_rounded,
-                      label: 'I/O Scheduler',
-                      accent: kTeal,
-                      subtitle: 'Optimasi storage',
-                      children: const [
-                        _CmdLeaf('noop', Icons.linear_scale_rounded, kGreen,
-                            'Minimal overhead',
-                            cmd:
-                                'for d in /sys/block/*/queue/scheduler; do echo noop > "\$d" 2>/dev/null; done; echo OK'),
-                        _CmdLeaf('deadline', Icons.timer_rounded, kOrange,
-                            'Responsif I/O',
-                            cmd:
-                                'for d in /sys/block/*/queue/scheduler; do echo deadline > "\$d" 2>/dev/null; done; echo OK'),
-                      ]),
+                  const SizedBox(height: 8),
+                  // ── LAYAR ───────────────────────────────────────────
+                  _sectionLabel('LAYAR & GESTURE', kPink),
+                  const SizedBox(height: 10),
+                  _dt2wGroup(),
 
-                  _CmdGroup(
-                      icon: Icons.dns_rounded,
-                      label: 'DNS Pribadi',
-                      accent: kBlue,
-                      subtitle: 'Private DNS (DoT)',
-                      children: const [
-                        _CmdLeaf('AdGuard', Icons.shield_rounded, kGreen,
-                            'Blokir iklan & tracker',
-                            cmd:
-                                'settings put global private_dns_mode hostname; settings put global private_dns_specifier dns.adguard-dns.com; echo OK'),
-                        _CmdLeaf('Cloudflare', Icons.cloud_rounded, kOrange,
-                            'Cepat & privat (1.1.1.1)',
-                            cmd:
-                                'settings put global private_dns_mode hostname; settings put global private_dns_specifier one.one.one.one; echo OK'),
-                        _CmdLeaf('Quad9', Icons.security_rounded, kBlue,
-                            'Blokir situs berbahaya',
-                            cmd:
-                                'settings put global private_dns_mode hostname; settings put global private_dns_specifier dns.quad9.net; echo OK'),
-                        _CmdLeaf('Google', Icons.public_rounded, kCyan,
-                            'DNS Google (8.8.8.8)',
-                            cmd:
-                                'settings put global private_dns_mode hostname; settings put global private_dns_specifier dns.google; echo OK'),
-                        _CmdLeaf('Matikan DNS Pribadi',
-                            Icons.power_settings_new_rounded, kRed,
-                            'Kembali ke otomatis',
-                            cmd:
-                                'settings put global private_dns_mode off; echo OK'),
-                        _CmdLeaf('Cek DNS Aktif', Icons.search_rounded,
-                            kPurple, 'Lihat private DNS sekarang',
-                            cmd:
-                                'settings get global private_dns_specifier',
-                            readOnly: true),
-                      ]),
-
-                  _CmdGroup(
-                      icon: Icons.network_check_rounded,
-                      label: 'TCP Network',
-                      accent: kGreen,
-                      subtitle: 'Congestion control',
-                      children: const [
-                        _CmdLeaf('TCP BBR', Icons.compress_rounded, kGreen,
-                            'Algoritma Google BBR',
-                            cmd:
-                                'echo bbr > /proc/sys/net/ipv4/tcp_congestion_control'),
-                        _CmdLeaf('TCP Cubic', Icons.show_chart_rounded,
-                            kPurple, 'Default Linux',
-                            cmd:
-                                'echo cubic > /proc/sys/net/ipv4/tcp_congestion_control'),
-                      ]),
-
-                  // DT2W — SELALU tampil. Memakai settings system
-                  // os_action_tapping_wake (kunci Transsion/Infinix).
-                  // Node hardware goodix SENGAJA tidak dipakai: menulis ke
-                  // node itu pernah menyebabkan device reboot.
-                  _CmdGroup(
-                      icon: Icons.touch_app_rounded,
-                      label: 'Layar & Gesture',
-                      accent: kPink,
-                      subtitle: 'Double tap to wake — aman via settings',
-                      children: const [
-                        _CmdLeaf('DT2W: Aktifkan', Icons.touch_app_rounded,
-                            kGreen, 'Ketuk 2x untuk bangunkan layar',
-                            cmd:
-                                'settings put system os_action_tapping_wake 1; echo OK'),
-                        _CmdLeaf('DT2W: Matikan', Icons.do_not_touch_rounded,
-                            kRed, 'Nonaktifkan gesture wake',
-                            cmd:
-                                'settings put system os_action_tapping_wake 0; echo OK'),
-                        _CmdLeaf('Cek Status DT2W', Icons.search_rounded,
-                            kCyan, '1 = aktif · 0/null = mati',
-                            cmd:
-                                'settings get system os_action_tapping_wake',
-                            readOnly: true),
-                      ]),
-
-                  _CmdGroup(
-                      icon: Icons.settings_rounded,
-                      label: 'System',
-                      accent: kYellow,
-                      subtitle: 'Info & reboot',
-                      children: const [
-                        _CmdLeaf('Info Build', Icons.info_rounded, kCyan,
-                            'Model & versi Android',
-                            cmd:
-                                'getprop ro.product.model; getprop ro.board.platform; getprop ro.build.version.release',
-                            readOnly: true),
-                        _CmdLeaf('Clear Logcat', Icons.delete_rounded, kOrange,
-                            'Bersihkan buffer log', cmd: 'logcat -c'),
-                        _CmdLeaf('Reboot', Icons.restart_alt_rounded, kRed,
-                            'Mulai ulang perangkat',
-                            cmd: 'reboot', danger: true),
-                      ]),
+                  const SizedBox(height: 8),
+                  // ── AKSI CEPAT ──────────────────────────────────────
+                  _sectionLabel('AKSI CEPAT', kOrange),
+                  const SizedBox(height: 10),
+                  const _QuickActions(),
 
                   const SizedBox(height: 24),
                 ]),
@@ -1974,73 +2209,263 @@ class CommandTab extends StatelessWidget {
     );
   }
 
-  // ── CPU Governor: tulis ke policy* (satu tulis per cluster, bukan
-  //    per-core — lebih bersih & setara karena core dalam cluster share
-  //    file governor yang sama). ──
-  _CmdGroup? _buildGovGroup() {
+  // ── CPU Governor: tulis ke policy* (satu tulis per cluster). Chip yang
+  //    sedang aktif dibaca langsung dari sysfs — tanpa buka dialog. ──
+  _ChoiceGroup? _buildGovGroup() {
     final govs = DeviceInfo.i.governors;
     if (govs.isEmpty) return null;
-    const meta = {
-      'performance': ['Semua cluster max — gaming', Icons.flash_on_rounded, kRed],
-      'powersave': ['Hemat daya maksimal', Icons.battery_saver_rounded, kGreen],
-      'schedutil': ['Adaptif — rekomendasi harian', Icons.schedule_rounded, kCyan],
-      'ondemand': ['Naik cepat saat butuh', Icons.trending_up_rounded, kOrange],
-      'conservative': ['Naik pelan — hemat', Icons.trending_down_rounded, kBlue],
-      'interactive': ['Responsif untuk UI', Icons.touch_app_rounded, kPurple],
+    const sub = {
+      'performance': 'Gaming — max',
+      'powersave': 'Hemat penuh',
+      'schedutil': 'Harian ✦',
+      'ondemand': 'Naik cepat',
+      'conservative': 'Naik pelan',
+      'interactive': 'Responsif UI',
     };
-    final leaves = govs.map((g) {
-      final m = meta[g];
-      return _CmdLeaf(
-        g,
-        m != null ? m[1] as IconData : Icons.tune_rounded,
-        m != null ? m[2] as Color : kTeal,
-        m != null ? m[0] as String : 'Governor $g',
-        cmd:
-            'ok=0; for f in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do echo $g > "\$f" 2>/dev/null && ok=1; done; [ \$ok -eq 1 ] && echo OK || echo "ERR: gagal menulis governor"',
-      );
-    }).toList();
-    return _CmdGroup(
-        icon: Icons.developer_board_rounded,
-        label: 'CPU Governor',
-        accent: kCyan,
-        subtitle: '${govs.length} governor · semua cluster',
-        children: leaves);
+    return _ChoiceGroup(
+      icon: Icons.developer_board_rounded,
+      label: 'CPU Governor',
+      accent: kCyan,
+      note: 'Berlaku untuk semua cluster sekaligus.',
+      readCmd:
+          'cat /sys/devices/system/cpu/cpufreq/policy*/scaling_governor 2>/dev/null | head -1',
+      choices: [
+        for (final g in govs)
+          _Choice(g, g,
+              sub: sub[g],
+              cmd:
+                  'ok=0; for f in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do echo $g > "\$f" 2>/dev/null && ok=1; done; [ \$ok -eq 1 ] && echo OK || echo "ERR: gagal menulis governor"'),
+      ],
+    );
   }
 
   // ── CPU Frekuensi: tier PERSENTASE per-cluster. Tiap policy dihitung
   //    dari cpuinfo_max-nya sendiri, jadi LITTLE/BIG/PRIME turun
-  //    proporsional (bukan satu angka dipaksakan ke semua cluster yang
-  //    pasti ditolak kernel karena tabel frekuensinya beda). ──
-  _CmdGroup? _buildFreqGroup() {
+  //    proporsional. Tier aktif dideteksi dari rasio scaling_max /
+  //    cpuinfo_max policy pertama. Chip "Full" sekaligus reset penuh
+  //    (mengembalikan max & min hardware). ──
+  _ChoiceGroup? _buildFreqGroup() {
     final d = DeviceInfo.i;
     if (d.policies.isEmpty) return null;
-    final leaves = <_CmdLeaf>[
-      _CmdLeaf('Full Power', Icons.rocket_launch_rounded, kRed,
-          '100% — performa penuh', cmd: _tierCmd(100)),
-      _CmdLeaf('Tinggi', Icons.bolt_rounded, kOrange,
-          '±80% dari max tiap cluster', cmd: _tierCmd(80)),
-      _CmdLeaf('Seimbang', Icons.eco_rounded, kGreen,
-          '±60% — harian adem', cmd: _tierCmd(60)),
-      _CmdLeaf('Hemat Daya', Icons.battery_saver_rounded, kBlue,
-          '±40% — baterai maksimal', cmd: _tierCmd(40)),
-      const _CmdLeaf('Reset ke Default', Icons.restart_alt_rounded, kTeal,
-          'Pulihkan rentang penuh hardware', cmd: _resetFreqCmd),
-    ];
-    return _CmdGroup(
-        icon: Icons.speed_rounded,
-        label: 'CPU Frekuensi',
-        accent: kOrange,
-        subtitle: d.clusterSummary.isEmpty
-            ? 'Kunci frekuensi per-cluster'
-            : d.clusterSummary,
-        children: leaves);
+    return _ChoiceGroup(
+      icon: Icons.speed_rounded,
+      label: 'CPU Frekuensi',
+      accent: kOrange,
+      note: d.clusterSummary.isEmpty
+          ? 'Kunci frekuensi per-cluster'
+          : d.clusterSummary,
+      readCmd: _readTierCmd,
+      parse: (raw) {
+        final p = int.tryParse(raw.trim());
+        if (p == null) return '';
+        if (p >= 92) return '100';
+        if (p >= 70) return '80';
+        if (p >= 50) return '60';
+        return '40';
+      },
+      choices: [
+        const _Choice('100', 'Full', sub: '100% — default', cmd: _resetFreqCmd),
+        _Choice('80', 'Tinggi', sub: '±80% tiap cluster', cmd: _tierCmd(80)),
+        _Choice('60', 'Seimbang', sub: '±60% — adem', cmd: _tierCmd(60)),
+        _Choice('40', 'Hemat', sub: '±40% — baterai', cmd: _tierCmd(40)),
+      ],
+    );
   }
+
+  // ── Thermal throttle sebagai saklar dua-pilihan dengan status live. ──
+  _ChoiceGroup _thermalGroup() => _ChoiceGroup(
+        icon: Icons.thermostat_rounded,
+        label: 'Thermal Throttle',
+        accent: kRed,
+        note: 'Mati = performa tanpa rem suhu — pantau Dashboard!',
+        readCmd: 'cat /sys/class/thermal/thermal_zone0/mode 2>/dev/null',
+        parse: (r) => r.contains('disabled')
+            ? 'off'
+            : r.contains('enabled')
+                ? 'on'
+                : '',
+        choices: const [
+          _Choice('on', 'Aktif', sub: 'Aman — default',
+              cmd:
+                  'ok=0; for m in /sys/class/thermal/thermal_zone*/mode; do echo enabled > "\$m" 2>/dev/null && ok=1; done; [ \$ok -eq 1 ] && echo OK || echo "ERR: node mode tidak tersedia"'),
+          _Choice('off', 'Mati', sub: 'Tanpa throttle', danger: true,
+              cmd:
+                  'ok=0; for m in /sys/class/thermal/thermal_zone*/mode; do echo disabled > "\$m" 2>/dev/null && ok=1; done; [ \$ok -eq 1 ] && echo OK || echo "ERR: node mode tidak tersedia"'),
+        ],
+      );
+
+  // ── Network / Band Lock — chip menyorot MODE tersimpan (settings),
+  //    sedangkan tipe jaringan aktual tampil live di header ("Sinyal: …").
+  //    Kode mode dari RILConstants: 26 = NR/LTE/GSM/WCDMA · 11 = LTE only
+  //    · 9 = LTE/GSM/WCDMA. Ditulis juga ke key per-slot untuk dual-SIM. ──
+  static String _netCmd(int mode) =>
+      'settings put global preferred_network_mode $mode; '
+      'settings put global preferred_network_mode0 $mode; '
+      'settings put global preferred_network_mode1 $mode; echo OK';
+
+  _ChoiceGroup _bandLockGroup() => _ChoiceGroup(
+        icon: Icons.signal_cellular_alt_rounded,
+        label: 'Network / Band Lock',
+        accent: kBlue,
+        note: 'Dukungan tergantung modem. Kalau tidak berubah, coba mode lain.',
+        pollEvery: 6,
+        readCmd:
+            'm=\$(settings get global preferred_network_mode0 2>/dev/null); { [ -n "\$m" ] && [ "\$m" != "null" ]; } || m=\$(settings get global preferred_network_mode 2>/dev/null); echo "\$m"',
+        parse: (r) => r == '26'
+            ? '5g'
+            : r == '11'
+                ? '4g'
+                : r == '9'
+                    ? '4g3g'
+                    : '',
+        statusCmd:
+            'dumpsys telephony.registry | grep -oE "mDataNetworkType=[A-Za-z0-9_]+" | head -1',
+        statusParse: (r) {
+          final v = r.replaceFirst('mDataNetworkType=', '').trim();
+          return (v.isEmpty || v == 'OK') ? '' : 'Sinyal: $v';
+        },
+        choices: [
+          _Choice('5g', '5G Preferred',
+              sub: 'NR/LTE — jangkauan penuh', cmd: _netCmd(26)),
+          _Choice('4g', '4G Only', sub: 'LTE saja — stabil', cmd: _netCmd(11)),
+          _Choice('4g3g', '4G/3G',
+              sub: 'LTE + fallback WCDMA', cmd: _netCmd(9)),
+        ],
+      );
+
+  // ── DNS Pribadi (DoT) — provider aktif dideteksi dari specifier. ──
+  static String _dnsCmd(String host) =>
+      'settings put global private_dns_mode hostname; settings put global private_dns_specifier $host; echo OK';
+
+  _ChoiceGroup _dnsGroup() => _ChoiceGroup(
+        icon: Icons.dns_rounded,
+        label: 'DNS Pribadi',
+        accent: kTeal,
+        readCmd:
+            'm=\$(settings get global private_dns_mode 2>/dev/null); s=\$(settings get global private_dns_specifier 2>/dev/null); echo "\$m|\$s"',
+        parse: (r) {
+          final i = r.indexOf('|');
+          final m = (i < 0 ? r : r.substring(0, i)).trim();
+          final s = i < 0 ? '' : r.substring(i + 1).trim();
+          if (m != 'hostname') return 'off';
+          if (s.contains('adguard')) return 'adguard';
+          if (s.contains('one.one')) return 'cf';
+          if (s.contains('quad9')) return 'q9';
+          if (s.contains('dns.google')) return 'g';
+          return '';
+        },
+        choices: [
+          _Choice('adguard', 'AdGuard',
+              sub: 'Blokir iklan', cmd: _dnsCmd('dns.adguard-dns.com')),
+          _Choice('cf', 'Cloudflare',
+              sub: '1.1.1.1', cmd: _dnsCmd('one.one.one.one')),
+          _Choice('q9', 'Quad9',
+              sub: 'Anti-malware', cmd: _dnsCmd('dns.quad9.net')),
+          _Choice('g', 'Google', sub: '8.8.8.8', cmd: _dnsCmd('dns.google')),
+          const _Choice('off', 'Off',
+              sub: 'Otomatis',
+              cmd: 'settings put global private_dns_mode off; echo OK'),
+        ],
+      );
+
+  // ── TCP congestion control — nilai aktif dibaca dari procfs. ──
+  _ChoiceGroup _tcpGroup() => _ChoiceGroup(
+        icon: Icons.network_check_rounded,
+        label: 'TCP Congestion',
+        accent: kGreen,
+        readCmd: 'cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null',
+        parse: (r) => (r == 'bbr' || r == 'cubic') ? r : '',
+        choices: const [
+          _Choice('bbr', 'BBR',
+              sub: 'Algoritma Google',
+              cmd:
+                  'echo bbr > /proc/sys/net/ipv4/tcp_congestion_control && echo OK || echo "ERR: bbr tidak tersedia di kernel"'),
+          _Choice('cubic', 'Cubic',
+              sub: 'Default Linux',
+              cmd:
+                  'echo cubic > /proc/sys/net/ipv4/tcp_congestion_control && echo OK || echo "ERR: gagal menulis"'),
+        ],
+      );
+
+  // ── Swappiness — nilai aktif dibaca dari /proc. ──
+  _ChoiceGroup _swappinessGroup() => _ChoiceGroup(
+        icon: Icons.swap_horiz_rounded,
+        label: 'Swappiness',
+        accent: kPurple,
+        readCmd: 'cat /proc/sys/vm/swappiness 2>/dev/null',
+        parse: (r) => (r == '10' || r == '60') ? r : '',
+        choices: const [
+          _Choice('10', '10', sub: 'Prioritaskan RAM',
+              cmd: 'echo 10 > /proc/sys/vm/swappiness && echo OK'),
+          _Choice('60', '60', sub: 'Seimbang — default',
+              cmd: 'echo 60 > /proc/sys/vm/swappiness && echo OK'),
+        ],
+      );
+
+  // ── I/O Scheduler — scheduler aktif = nilai dalam kurung [x].
+  //    Kernel modern memakai nama blk-mq (none / mq-deadline), jadi tiap
+  //    chip mencoba nama legacy dulu lalu fallback ke nama mq. ──
+  _ChoiceGroup _ioGroup() => _ChoiceGroup(
+        icon: Icons.storage_rounded,
+        label: 'I/O Scheduler',
+        accent: kTeal,
+        readCmd: 'cat /sys/block/*/queue/scheduler 2>/dev/null | head -1',
+        parse: (r) {
+          final m = RegExp(r'\[([a-z\-]+)\]').firstMatch(r);
+          final v = m?.group(1) ?? '';
+          if (v == 'noop' || v == 'none') return 'noop';
+          if (v == 'deadline' || v == 'mq-deadline') return 'deadline';
+          return '';
+        },
+        choices: const [
+          _Choice('noop', 'Noop / None',
+              sub: 'Overhead minimal',
+              cmd:
+                  'ok=0; for d in /sys/block/*/queue/scheduler; do { echo noop > "\$d" 2>/dev/null || echo none > "\$d" 2>/dev/null; } && ok=1; done; [ \$ok -eq 1 ] && echo OK || echo "ERR: scheduler tidak tersedia"'),
+          _Choice('deadline', 'Deadline',
+              sub: 'Responsif I/O',
+              cmd:
+                  'ok=0; for d in /sys/block/*/queue/scheduler; do { echo deadline > "\$d" 2>/dev/null || echo mq-deadline > "\$d" 2>/dev/null; } && ok=1; done; [ \$ok -eq 1 ] && echo OK || echo "ERR: scheduler tidak tersedia"'),
+        ],
+      );
+
+  // ── DT2W via settings system os_action_tapping_wake (kunci
+  //    Transsion/Infinix). Node hardware goodix SENGAJA tidak dipakai:
+  //    menulis ke node itu pernah menyebabkan device reboot. ──
+  _ChoiceGroup _dt2wGroup() => _ChoiceGroup(
+        icon: Icons.touch_app_rounded,
+        label: 'Double Tap to Wake',
+        accent: kPink,
+        note: 'Aman via settings — bukan node hardware.',
+        readCmd: 'settings get system os_action_tapping_wake 2>/dev/null',
+        parse: (r) => r == '1'
+            ? 'on'
+            : (r == '0' || r == 'null' || r.isEmpty || r == 'OK')
+                ? 'off'
+                : '',
+        choices: const [
+          _Choice('on', 'Aktif', sub: 'Ketuk 2x → layar nyala',
+              cmd: 'settings put system os_action_tapping_wake 1; echo OK'),
+          _Choice('off', 'Mati', sub: 'Gesture dimatikan',
+              cmd: 'settings put system os_action_tapping_wake 0; echo OK'),
+        ],
+      );
+
+  /// Baca tier aktif: rasio scaling_max/cpuinfo_max policy pertama (persen).
+  static const String _readTierCmd = '''
+p=""
+for d in /sys/devices/system/cpu/cpufreq/policy*; do p="\$d"; break; done
+[ -n "\$p" ] || exit 0
+m=\$(cat "\$p/cpuinfo_max_freq" 2>/dev/null)
+c=\$(cat "\$p/scaling_max_freq" 2>/dev/null)
+[ -n "\$m" ] && [ -n "\$c" ] && [ "\$m" -gt 0 ] && echo \$((c * 100 / m))
+''';
 
   /// Skrip tier frekuensi (POSIX murni — tanpa awk/bc, jalan di toybox).
   /// ATURAN URUTAN PENTING: scaling_min TIDAK BOLEH melebihi scaling_max
   /// walau sesaat — kernel menolak tulisan itu. Maka saat MENURUNKAN max:
   /// turunkan min ke cpuinfo_min dulu, baru tulis max target.
-  String _tierCmd(int pct) => '''
+  static String _tierCmd(int pct) => '''
 ok=0
 for pol in /sys/devices/system/cpu/cpufreq/policy*; do
   [ -f "\$pol/scaling_max_freq" ] || continue
@@ -2361,24 +2786,70 @@ echo OK''');
   }
 }
 
+
 // ─────────────────────────────────────────────────────────────────────
-// NETWORK / BAND LOCK — preferensi mode jaringan + monitoring tipe
-// jaringan aktual. Kode mode dari RILConstants:
-//   26 = NR/LTE/GSM/WCDMA (5G preferred) · 11 = LTE only · 9 = LTE/GSM/WCDMA
-// Catatan: mode 0 (yang dulu dipakai sebagai "Auto") sebenarnya
-// WCDMA-preferred TANPA LTE — itu bug lama yang diperbaiki di sini.
+// CHOICE GROUP — pengganti dialog perintah. Satu kartu = satu setelan;
+// semua pilihan tampil sebagai chip INLINE dan yang aktif dibaca live
+// dari sistem, jadi alur "ketuk kartu → dialog → ketuk → tutup" menjadi
+// cukup SATU ketukan. Pola jendela-proteksi 6 detik mengikuti
+// _RefreshRateGroup: pilihan user langsung tersorot & tidak berkedip
+// digeser hasil poll berikutnya.
+//   readCmd    : shell pembaca status → di-parse jadi key chip aktif.
+//   statusCmd  : (opsional) status live tambahan di header, mis. tipe
+//                sinyal aktual pada Band Lock.
+//   pollEvery  : (opsional) poll berkala N detik; default hanya poll saat
+//                tab terlihat & sesudah apply — hemat proses shell.
 // ─────────────────────────────────────────────────────────────────────
-class _BandLockGroup extends StatefulWidget {
-  const _BandLockGroup();
-  @override
-  State<_BandLockGroup> createState() => _BandLockGroupState();
+class _Choice {
+  const _Choice(this.key, this.label, {this.sub, this.cmd, this.danger = false});
+  final String key;    // identitas — dicocokkan dengan hasil readCmd
+  final String label;  // teks chip
+  final String? sub;   // subteks kecil di bawah label
+  final String? cmd;   // shell yang dijalankan saat chip diketuk
+  final bool danger;   // minta konfirmasi dulu
 }
 
-class _BandLockGroupState extends State<_BandLockGroup> {
-  String _current = '---';
+class _ChoiceGroup extends StatefulWidget {
+  const _ChoiceGroup({
+    required this.icon,
+    required this.label,
+    required this.accent,
+    required this.choices,
+    this.readCmd,
+    this.parse,
+    this.statusCmd,
+    this.statusParse,
+    this.note,
+    this.pollEvery,
+  });
+
+  final IconData icon;
+  final String label;
+  final Color accent;
+  final List<_Choice> choices;
+  final String? readCmd;
+  final String Function(String raw)? parse;
+  final String? statusCmd;
+  final String Function(String raw)? statusParse;
+  final String? note;
+  final int? pollEvery;
+
+  @override
+  State<_ChoiceGroup> createState() => _ChoiceGroupState();
+}
+
+class _ChoiceGroupState extends State<_ChoiceGroup> {
+  String _current = '';   // key chip aktif ('' = belum diketahui)
+  String _status = '';    // status live tambahan (mis. "Sinyal: LTE")
+  bool _known = false;    // true begitu readCmd berhasil dibaca sekali
+  String? _held;          // pilihan user — dilindungi dari poll sesaat
+  DateTime? _holdUntil;
   Timer? _timer;
   late final TabGate _gate;
   bool _polling = false;
+
+  bool get _inHold =>
+      _holdUntil != null && DateTime.now().isBefore(_holdUntil!);
 
   @override
   void initState() {
@@ -2388,7 +2859,10 @@ class _BandLockGroupState extends State<_BandLockGroup> {
       onChanged: (on) {
         if (on) {
           _poll();
-          _timer = Timer.periodic(const Duration(seconds: 5), (_) => _poll());
+          final s = widget.pollEvery;
+          if (s != null) {
+            _timer = Timer.periodic(Duration(seconds: s), (_) => _poll());
+          }
         } else {
           _timer?.cancel();
           _timer = null;
@@ -2404,58 +2878,96 @@ class _BandLockGroupState extends State<_BandLockGroup> {
     super.dispose();
   }
 
+  Future<String> _sh(String cmd) async =>
+      isRootNotifier.value ? Root.exec(cmd) : Sys.sh(cmd);
+
+  bool _usable(String raw) =>
+      raw.isNotEmpty &&
+      !raw.startsWith('ERR') &&
+      raw != 'NO_ROOT' &&
+      raw != 'OK' &&
+      raw != 'timeout';
+
   Future<void> _poll() async {
     if (_polling) return;
     _polling = true;
     try {
-      if (!isRootNotifier.value) {
-        if (mounted) setState(() => _current = 'Butuh root');
-        return;
+      if (widget.readCmd != null) {
+        final raw = await _sh(widget.readCmd!);
+        if (!mounted) return;
+        if (_usable(raw)) {
+          final key = widget.parse?.call(raw.trim()) ?? raw.trim();
+          setState(() {
+            _current = key;
+            _known = true; // status terbaca — walau tak cocok chip mana pun
+          });
+        }
       }
-      final out = await Root.exec(
-          'dumpsys telephony.registry | grep -oE "mDataNetworkType=[A-Za-z0-9_]+" | head -1');
-      if (!mounted) return;
-      if (out.startsWith('ERR') || out == 'OK' || out.isEmpty) {
-        setState(() => _current = '---');
-      } else {
-        final cleaned = out.replaceFirst('mDataNetworkType=', '').trim();
-        setState(() => _current = cleaned.isEmpty ? '---' : cleaned);
+      if (widget.statusCmd != null) {
+        final raw = await _sh(widget.statusCmd!);
+        if (!mounted) return;
+        if (_usable(raw)) {
+          final s = widget.statusParse?.call(raw.trim()) ?? raw.trim();
+          setState(() => _status = s);
+        }
       }
     } finally {
       _polling = false;
     }
   }
 
-  Future<void> _apply(String label, String cmd) async {
+  Future<void> _apply(_Choice c) async {
+    final cmd = c.cmd;
+    if (cmd == null) return;
     if (!isRootNotifier.value) {
-      showSnack(context, '⚠ Butuh akses root untuk mengatur mode jaringan');
+      showSnack(context, '⚠ Butuh akses root untuk ${widget.label}');
       return;
     }
+    if (c.danger) {
+      final ok = await confirmAction(context,
+          title: '${widget.label}: ${c.label}',
+          message:
+              'Perintah ini berdampak besar pada sistem. Yakin melanjutkan?',
+          accent: widget.accent);
+      if (!ok || !mounted) return;
+    }
     HapticFeedback.mediumImpact();
+    // Jendela proteksi SEBELUM eksekusi — chip langsung tersorot.
+    setState(() {
+      _held = c.key;
+      _holdUntil = DateTime.now().add(const Duration(seconds: 6));
+    });
     final out = await Root.exec(cmd);
     if (!mounted) return;
     final err = out.startsWith('ERR');
-    showSnack(
-        context,
-        err
-            ? '✗ Gagal — modem mungkin tak mendukung: ${_stripErr(out)}'
-            : '✓ $label diterapkan');
-    await Future.delayed(const Duration(milliseconds: 800));
+    showSnack(context,
+        err ? '✗ Gagal: ${_stripErr(out)}' : '✓ ${c.label} diterapkan');
+    if (err) {
+      setState(() {
+        _held = null;
+        _holdUntil = null;
+      });
+    }
+    await Future.delayed(const Duration(milliseconds: 700));
     if (mounted) _poll();
   }
 
   @override
   Widget build(BuildContext context) {
-    // Tulis juga ke key per-slot (mode0/mode1) supaya berlaku di dual-SIM.
-    String cmdFor(int mode) =>
-        'settings put global preferred_network_mode $mode; '
-        'settings put global preferred_network_mode0 $mode; '
-        'settings put global preferred_network_mode1 $mode; echo OK';
-    final modes = [
-      ('5G Preferred', 'NR/LTE/GSM/WCDMA — jangkauan penuh', kPurple, cmdFor(26)),
-      ('4G Only', 'LTE saja — stabil, tanpa fallback', kGreen, cmdFor(11)),
-      ('4G/3G', 'LTE + fallback 3G (WCDMA)', kCyan, cmdFor(9)),
-    ];
+    final active = widget.choices
+        .where((c) => c.key == _current && c.key.isNotEmpty)
+        .toList();
+    final activeLabel = active.isEmpty ? '' : active.first.label;
+    final unknown = !_known && _status.isEmpty;
+    final statusTxt = unknown
+        ? 'Membaca status…'
+        : [
+            if (_known)
+              activeLabel.isNotEmpty
+                  ? 'Aktif: $activeLabel'
+                  : 'Kustom / tidak dikenali',
+            if (_status.isNotEmpty) _status,
+          ].join(' · ');
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
       child: Container(
@@ -2469,17 +2981,16 @@ class _BandLockGroupState extends State<_BandLockGroup> {
             Container(
                 padding: const EdgeInsets.all(10),
                 decoration: BoxDecoration(
-                    color: kBlue.withOpacity(.12),
+                    color: widget.accent.withOpacity(.12),
                     borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: kBlue.withOpacity(.2))),
-                child: Icon(Icons.signal_cellular_alt_rounded,
-                    color: kBlue, size: 20)),
+                    border: Border.all(color: widget.accent.withOpacity(.2))),
+                child: Icon(widget.icon, color: widget.accent, size: 20)),
             const SizedBox(width: 12),
             Expanded(
                 child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                  Text('Network / Band Lock',
+                  Text(widget.label,
                       style: TextStyle(
                           color: kWhite,
                           fontSize: 14,
@@ -2492,63 +3003,71 @@ class _BandLockGroupState extends State<_BandLockGroup> {
                         margin: const EdgeInsets.only(right: 5),
                         decoration: BoxDecoration(
                             shape: BoxShape.circle,
-                            color: (_current == '---' ||
-                                    _current == 'Butuh root')
-                                ? mut(.2)
-                                : kGreen)),
-                    Text(
-                        _current == '---'
-                            ? 'Membaca status…'
-                            : 'Aktif: $_current',
-                        style: TextStyle(color: mut(.4), fontSize: 10.5)),
+                            color: unknown ? mut(.2) : kGreen)),
+                    Expanded(
+                        child: Text(statusTxt,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style:
+                                TextStyle(color: mut(.4), fontSize: 10.5))),
                   ]),
                 ])),
           ]),
-          const SizedBox(height: 4),
-          Text(
-              'Catatan: dukungan tergantung modem. Kalau tidak berubah, coba mode lain.',
-              style: TextStyle(color: mut(.28), fontSize: 9.5, height: 1.3)),
-          const SizedBox(height: 10),
-          ...modes.map((m) => Padding(
-                padding: const EdgeInsets.only(bottom: 6),
-                child: Tap(
-                  onTap: () => _apply(m.$1, m.$4),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 14, vertical: 12),
-                    decoration: BoxDecoration(
-                        color: kPanel2,
-                        borderRadius: BorderRadius.circular(14),
-                        border: Border.all(color: kBorder.withOpacity(.4))),
-                    child: Row(children: [
-                      Container(
-                          width: 2.5,
-                          height: 32,
-                          decoration: BoxDecoration(
-                              color: m.$3.withOpacity(.55),
-                              borderRadius: BorderRadius.circular(2))),
-                      const SizedBox(width: 12),
-                      Icon(Icons.cell_tower_rounded, color: m.$3, size: 18),
-                      const SizedBox(width: 10),
-                      Expanded(
-                          child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                            Text(m.$1,
-                                style: TextStyle(
-                                    color: kWhite,
-                                    fontSize: 12.5,
-                                    fontWeight: FontWeight.w600)),
-                            Text(m.$2,
-                                style: TextStyle(
-                                    color: mut(.35), fontSize: 10)),
-                          ])),
-                      Icon(Icons.chevron_right_rounded,
-                          color: mut(.25), size: 18),
-                    ]),
-                  ),
-                ),
-              )),
+          if (widget.note != null) ...[
+            const SizedBox(height: 6),
+            Text(widget.note!,
+                style: TextStyle(color: mut(.28), fontSize: 9.5, height: 1.3)),
+          ],
+          const SizedBox(height: 12),
+          Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: widget.choices.map(_chip).toList()),
+        ]),
+      ),
+    );
+  }
+
+  Widget _chip(_Choice c) {
+    final hl = _inHold ? _held : _current;
+    final on = c.key.isNotEmpty && hl == c.key;
+    final a = widget.accent;
+    return Tap(
+      onTap: () => _apply(c),
+      child: AnimatedContainer(
+        duration: Motion.fast,
+        curve: Motion.curve,
+        padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
+        decoration: BoxDecoration(
+            color: on ? a.withOpacity(.16) : mut(.04),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: on ? a : kBorder.withOpacity(.4))),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          if (on) ...[
+            Icon(Icons.check_rounded, color: a, size: 13),
+            const SizedBox(width: 5),
+          ] else if (c.danger) ...[
+            Icon(Icons.warning_amber_rounded,
+                color: kRed.withOpacity(.7), size: 12),
+            const SizedBox(width: 5),
+          ],
+          Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(c.label,
+                    style: TextStyle(
+                        color: on ? a : kWhite,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700)),
+                if (c.sub != null) ...[
+                  const SizedBox(height: 1),
+                  Text(c.sub!,
+                      style: TextStyle(
+                          color: on ? a.withOpacity(.7) : mut(.32),
+                          fontSize: 9)),
+                ],
+              ]),
         ]),
       ),
     );
@@ -2556,240 +3075,99 @@ class _BandLockGroupState extends State<_BandLockGroup> {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// CMD GROUP — kartu kategori. Ketuk → dialog daftar perintah (scale+fade
-// 240ms). Dialog memakai ListView + kScroll supaya daftar panjang tetap
-// mulus digulir di dalam dialog.
-// ─────────────────────────────────────────────────────────────────────
-class _CmdGroup extends StatelessWidget {
-  const _CmdGroup(
-      {required this.icon,
-      required this.label,
-      required this.subtitle,
-      required this.accent,
-      required this.children});
-
-  final IconData icon;
-  final String label, subtitle;
-  final Color accent;
-  final List<_CmdLeaf> children;
-
-  void _open(BuildContext context) {
-    HapticFeedback.selectionClick();
-    showGeneralDialog(
-      context: context,
-      barrierDismissible: true,
-      barrierLabel: label,
-      barrierColor: Colors.black.withOpacity(.62),
-      transitionDuration: const Duration(milliseconds: 240),
-      transitionBuilder: (_, anim, __, child) {
-        final curved =
-            CurvedAnimation(parent: anim, curve: Motion.curve);
-        return FadeTransition(
-            opacity: curved,
-            child: ScaleTransition(
-                scale: Tween<double>(begin: .92, end: 1).animate(curved),
-                child: child));
-      },
-      pageBuilder: (_, __, ___) => _CmdDialog(
-          icon: icon,
-          label: label,
-          subtitle: subtitle,
-          accent: accent,
-          children: children),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 10),
-      child: Tap(
-        onTap: () => _open(context),
-        child: Container(
-          padding: const EdgeInsets.all(14),
-          decoration: BoxDecoration(
-              color: kPanel,
-              borderRadius: BorderRadius.circular(20),
-              border: Border.all(color: kBorder)),
-          child: Row(children: [
-            Container(
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                    color: accent.withOpacity(.12),
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: accent.withOpacity(.2))),
-                child: Icon(icon, color: accent, size: 20)),
-            const SizedBox(width: 12),
-            Expanded(
-                child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                  Text(label,
-                      style: TextStyle(
-                          color: kWhite,
-                          fontSize: 14,
-                          fontWeight: FontWeight.w700)),
-                  const SizedBox(height: 2),
-                  Text(subtitle,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(color: mut(.4), fontSize: 10.5)),
-                ])),
-            Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                decoration: BoxDecoration(
-                    color: accent.withOpacity(.1),
-                    borderRadius: BorderRadius.circular(8)),
-                child: Text('${children.length}',
-                    style: TextStyle(
-                        color: accent,
-                        fontSize: 10.5,
-                        fontWeight: FontWeight.w800,
-                        fontFamily: 'monospace'))),
-            const SizedBox(width: 6),
-            Icon(Icons.chevron_right_rounded, color: mut(.25), size: 20),
-          ]),
-        ),
-      ),
-    );
-  }
-}
-
-class _CmdDialog extends StatelessWidget {
-  const _CmdDialog(
-      {required this.icon,
-      required this.label,
-      required this.subtitle,
-      required this.accent,
-      required this.children});
-
-  final IconData icon;
-  final String label, subtitle;
-  final Color accent;
-  final List<_CmdLeaf> children;
-
-  @override
-  Widget build(BuildContext context) {
-    final size = MediaQuery.sizeOf(context);
-    return SafeArea(
-      child: Center(
-        child: Material(
-          color: Colors.transparent,
-          child: Container(
-            margin: const EdgeInsets.symmetric(horizontal: 20),
-            constraints:
-                BoxConstraints(maxWidth: 500, maxHeight: size.height * .82),
-            decoration: BoxDecoration(
-                color: kPanel,
-                borderRadius: BorderRadius.circular(24),
-                border: Border.all(color: accent.withOpacity(.25)),
-                boxShadow: [
-                  BoxShadow(
-                      color: Colors.black.withOpacity(.5),
-                      blurRadius: 40,
-                      offset: const Offset(0, 16)),
-                ]),
-            child: Column(mainAxisSize: MainAxisSize.min, children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 16, 12, 12),
-                child: Row(children: [
-                  Container(
-                      padding: const EdgeInsets.all(9),
-                      decoration: BoxDecoration(
-                          color: accent.withOpacity(.12),
-                          borderRadius: BorderRadius.circular(11)),
-                      child: Icon(icon, color: accent, size: 18)),
-                  const SizedBox(width: 11),
-                  Expanded(
-                      child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                        Text(label,
-                            style: TextStyle(
-                                color: kWhite,
-                                fontSize: 15,
-                                fontWeight: FontWeight.w800)),
-                        Text(subtitle,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style:
-                                TextStyle(color: mut(.4), fontSize: 10.5)),
-                      ])),
-                  Tap(
-                      onTap: () => Navigator.pop(context),
-                      child: Padding(
-                          padding: const EdgeInsets.all(6),
-                          child: Icon(Icons.close_rounded,
-                              color: mut(.4), size: 20))),
-                ]),
-              ),
-              Container(height: 1, color: kBorder.withOpacity(.6)),
-              Flexible(
-                child: ListView(
-                    shrinkWrap: true,
-                    physics: kScroll,
-                    padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
-                    children: children),
-              ),
-            ]),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// CMD LEAF — satu perintah.
+// AKSI CEPAT — perintah sekali-jalan (bukan pilihan) dalam grid 2 kolom.
 //   readOnly : boleh jalan TANPA root (via Sys.sh), hasil → bottom sheet.
-//   danger   : minta konfirmasi dulu (Reboot, Disable Throttle).
+//   danger   : minta konfirmasi dulu (Reboot).
 // ─────────────────────────────────────────────────────────────────────
-class _CmdLeaf extends StatefulWidget {
-  const _CmdLeaf(this.label, this.icon, this.color, this.desc,
-      {required this.cmd, this.readOnly = false, this.danger = false});
-
+class _QuickAction {
+  const _QuickAction(this.label, this.desc, this.icon, this.color, this.cmd,
+      {this.readOnly = false, this.danger = false});
   final String label, desc, cmd;
   final IconData icon;
   final Color color;
   final bool readOnly, danger;
-
-  @override
-  State<_CmdLeaf> createState() => _CmdLeafState();
 }
 
-class _CmdLeafState extends State<_CmdLeaf> {
+class _QuickActions extends StatelessWidget {
+  const _QuickActions();
+
+  static const List<_QuickAction> _actions = [
+    _QuickAction('Clear Cache', 'Bebaskan RAM',
+        Icons.cleaning_services_rounded, kGreen,
+        'sync; echo 3 > /proc/sys/vm/drop_caches'),
+    _QuickAction('Baca Suhu', 'Semua zona', Icons.thermostat_rounded, kCyan,
+        'for z in /sys/class/thermal/thermal_zone*; do t=\$(cat "\$z/temp" 2>/dev/null); n=\$(cat "\$z/type" 2>/dev/null); [ -n "\$t" ] && echo "\${n:-\$z}: \$t"; done',
+        readOnly: true),
+    _QuickAction('Info Build', 'Model & Android', Icons.info_rounded, kBlue,
+        'getprop ro.product.model; getprop ro.board.platform; getprop ro.build.version.release',
+        readOnly: true),
+    _QuickAction('Cek DNS', 'Private DNS aktif', Icons.search_rounded,
+        kPurple, 'settings get global private_dns_specifier',
+        readOnly: true),
+    _QuickAction('Clear Logcat', 'Bersihkan log', Icons.delete_rounded,
+        kOrange, 'logcat -c'),
+    _QuickAction('Reboot', 'Mulai ulang', Icons.restart_alt_rounded, kRed,
+        'reboot',
+        danger: true),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return GridView.builder(
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      padding: EdgeInsets.zero,
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 2,
+          mainAxisSpacing: 8,
+          crossAxisSpacing: 8,
+          mainAxisExtent: 64),
+      itemCount: _actions.length,
+      itemBuilder: (_, i) => _QuickTile(_actions[i]),
+    );
+  }
+}
+
+class _QuickTile extends StatefulWidget {
+  const _QuickTile(this.a);
+  final _QuickAction a;
+
+  @override
+  State<_QuickTile> createState() => _QuickTileState();
+}
+
+class _QuickTileState extends State<_QuickTile> {
   bool _flash = false, _running = false;
 
   Future<void> _exec() async {
+    final a = widget.a;
     if (_running) return;
-    if (widget.danger) {
+    if (a.danger) {
       final ok = await confirmAction(context,
-          title: widget.label,
+          title: a.label,
           message:
               'Perintah ini berdampak besar pada sistem. Yakin melanjutkan?',
-          accent: widget.color);
+          accent: a.color);
       if (!ok || !mounted) return;
     }
     HapticFeedback.mediumImpact();
     _running = true;
     try {
       final out = isRootNotifier.value
-          ? await Root.exec(widget.cmd)
-          : await Sys.sh(widget.cmd); // jalur non-root untuk leaf readOnly
+          ? await Root.exec(a.cmd)
+          : await Sys.sh(a.cmd); // jalur non-root untuk aksi readOnly
       if (!mounted) return;
       final isErr = out.startsWith('ERR');
-
-      if (widget.readOnly) {
+      if (a.readOnly) {
         showOutputSheet(context,
-            title: widget.label,
+            title: a.label,
             body: (out == 'OK' || out.isEmpty)
                 ? '(tidak ada output)'
                 : isErr
                     ? _stripErr(out)
                     : out,
-            icon: widget.icon,
-            color: isErr ? kRed : widget.color);
+            icon: a.icon,
+            color: isErr ? kRed : a.color);
         return;
       }
       if (isErr) {
@@ -2797,7 +3175,7 @@ class _CmdLeafState extends State<_CmdLeaf> {
         return;
       }
       setState(() => _flash = true);
-      showSnack(context, '✓ ${widget.label} diterapkan');
+      showSnack(context, '✓ ${a.label} diterapkan');
       Future.delayed(const Duration(milliseconds: 600), () {
         if (mounted) setState(() => _flash = false);
       });
@@ -2808,96 +3186,69 @@ class _CmdLeafState extends State<_CmdLeaf> {
 
   @override
   Widget build(BuildContext context) {
+    final a = widget.a;
     return ValueListenableBuilder<bool>(
       valueListenable: isRootNotifier,
       builder: (_, root, __) {
-        final locked = !root && !widget.readOnly;
-        return Padding(
-          padding: const EdgeInsets.only(bottom: 8),
-          child: Tap(
-            onTap: locked
-                ? () => showSnack(context, '⚠ Butuh akses root')
-                : _exec,
-            child: AnimatedContainer(
-              duration: Motion.fast,
-              curve: Motion.curve,
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 16, vertical: 15),
-              decoration: BoxDecoration(
-                  color: _flash
-                      ? widget.color.withOpacity(.18)
-                      : locked
-                          ? mut(.03)
-                          : kPanel2,
-                  borderRadius: BorderRadius.circular(16),
-                  border: Border.all(
-                      color: _flash
-                          ? widget.color.withOpacity(.5)
-                          : kBorder.withOpacity(.4))),
-              child: Row(children: [
-                Container(
-                    width: 3,
-                    height: 42,
-                    decoration: BoxDecoration(
-                        color: locked
-                            ? mut(.15)
-                            : widget.color.withOpacity(.55),
-                        borderRadius: BorderRadius.circular(2))),
-                const SizedBox(width: 13),
-                Icon(locked ? Icons.lock_rounded : widget.icon,
-                    color: locked ? mut(.3) : widget.color, size: 21),
-                const SizedBox(width: 12),
-                Expanded(
-                    child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                      Row(children: [
-                        Flexible(
-                            child: Text(widget.label,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                    color: kWhite,
-                                    fontSize: 13,
-                                    fontWeight: FontWeight.w700))),
-                        if (widget.danger) ...[
-                          const SizedBox(width: 6),
-                          Icon(Icons.warning_amber_rounded,
-                              color: kRed.withOpacity(.8), size: 13),
-                        ],
-                        if (widget.readOnly) ...[
-                          const SizedBox(width: 6),
-                          Container(
-                              padding: const EdgeInsets.symmetric(
-                                  horizontal: 5, vertical: 1.5),
-                              decoration: BoxDecoration(
-                                  color: widget.color.withOpacity(.1),
-                                  borderRadius: BorderRadius.circular(5)),
-                              child: Text('INFO',
-                                  style: TextStyle(
-                                      color: widget.color,
-                                      fontSize: 7.5,
-                                      fontWeight: FontWeight.w900,
-                                      letterSpacing: .8))),
-                        ],
-                      ]),
-                      const SizedBox(height: 2),
-                      Text(widget.desc,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                              color: mut(.38), fontSize: 10.5, height: 1.3)),
-                    ])),
-                const SizedBox(width: 8),
-                Icon(
-                    widget.readOnly
-                        ? Icons.visibility_rounded
-                        : Icons.play_arrow_rounded,
-                    color:
-                        locked ? mut(.2) : widget.color.withOpacity(.6),
-                    size: 18),
-              ]),
-            ),
+        final locked = !root && !a.readOnly;
+        return Tap(
+          onTap: locked
+              ? () => showSnack(context, '⚠ Butuh akses root')
+              : _exec,
+          child: AnimatedContainer(
+            duration: Motion.fast,
+            curve: Motion.curve,
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            decoration: BoxDecoration(
+                color: _flash
+                    ? a.color.withOpacity(.18)
+                    : locked
+                        ? mut(.03)
+                        : kPanel,
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(
+                    color: _flash ? a.color.withOpacity(.5) : kBorder)),
+            child: Row(children: [
+              Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                      color: (locked ? mut(.1) : a.color).withOpacity(.12),
+                      borderRadius: BorderRadius.circular(10)),
+                  child: Icon(locked ? Icons.lock_rounded : a.icon,
+                      color: locked ? mut(.3) : a.color, size: 17)),
+              const SizedBox(width: 10),
+              Expanded(
+                  child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                    Row(children: [
+                      Flexible(
+                          child: Text(a.label,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                  color: kWhite,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w700))),
+                      if (a.danger) ...[
+                        const SizedBox(width: 4),
+                        Icon(Icons.warning_amber_rounded,
+                            color: kRed.withOpacity(.8), size: 11),
+                      ],
+                      if (a.readOnly) ...[
+                        const SizedBox(width: 4),
+                        Icon(Icons.visibility_rounded,
+                            color: a.color.withOpacity(.55), size: 11),
+                      ],
+                    ]),
+                    const SizedBox(height: 1),
+                    Text(a.desc,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(color: mut(.35), fontSize: 9.5)),
+                  ])),
+            ]),
           ),
         );
       },
