@@ -1165,6 +1165,389 @@ class _RootShellState extends State<RootShell> {
 //  walau timer sedang jalan.
 // ═══════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════
+//  RAM CLEANER
+//  Pembersihan bertingkat lewat bottom sheet — dipakai kartu RAM di
+//  Dashboard dan Aksi Cepat di Command:
+//    Ringan     : drop page cache (aman, instan).
+//    Sedang     : + `am kill-all` — ActivityManager menutup SEMUA proses
+//                 background yang aman ditutup (whitelist system dijaga
+//                 Android sendiri).
+//    Menyeluruh : + force-stop seluruh app pihak ketiga (kecuali app
+//                 foreground = app ini) + kill -9 proses cached
+//                 (oom_score_adj >= 900). Butuh konfirmasi: musik/alarm/
+//                 notifikasi app lain ikut berhenti.
+//  Hasil diukur nyata: MemAvailable sebelum vs sesudah.
+// ═══════════════════════════════════════════════════════════════════
+
+enum RamCleanLevel { ringan, sedang, menyeluruh }
+
+class _RamStep {
+  const _RamStep(this.label, this.cmd);
+  final String label, cmd;
+}
+
+const String _ramDropCmd = 'sync; echo 3 > /proc/sys/vm/drop_caches; echo OK';
+
+const String _ramKillAllCmd = 'am kill-all; echo OK';
+
+/// kill -9 semua proses CACHED (adj >= 900). App foreground (termasuk app
+/// ini) ber-adj 0 dan proses sistem persistent ber-adj negatif — keduanya
+/// otomatis lolos dari filter.
+const String _ramKillCachedCmd = '''
+n=0
+for d in /proc/[0-9]*; do
+  adj=\$(cat "\$d/oom_score_adj" 2>/dev/null) || continue
+  case "\$adj" in ''|-*) continue;; esac
+  if [ "\$adj" -ge 900 ]; then
+    kill -9 "\${d#/proc/}" 2>/dev/null && n=\$((n+1))
+  fi
+done
+echo "OK: \$n proses cached dimatikan"
+''';
+
+/// Force-stop semua paket pihak ketiga KECUALI app foreground (app ini).
+/// Kalau deteksi foreground gagal, tahap ini di-SKIP total — lebih baik
+/// kurang bersih daripada app ini ikut tertutup.
+const String _ramForceStopCmd = '''
+fg=\$(dumpsys window 2>/dev/null | grep -m1 mCurrentFocus | grep -oE '[A-Za-z0-9._]+/' | tail -1 | tr -d /)
+[ -n "\$fg" ] || { echo "SKIP: app foreground tidak terdeteksi"; exit 0; }
+n=0
+for p in \$(pm list packages -3 2>/dev/null | cut -d: -f2); do
+  [ "\$p" = "\$fg" ] && continue
+  am force-stop "\$p" 2>/dev/null && n=\$((n+1))
+done
+echo "OK: \$n aplikasi ditutup paksa"
+''';
+
+Future<void> showRamCleanSheet(BuildContext context,
+    {Future<void> Function()? onDone}) async {
+  await showModalBottomSheet(
+    context: context,
+    backgroundColor: kPanel,
+    isScrollControlled: true,
+    shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(22))),
+    builder: (_) => _RamCleanSheet(onDone: onDone),
+  );
+}
+
+class _RamCleanSheet extends StatefulWidget {
+  const _RamCleanSheet({this.onDone});
+  final Future<void> Function()? onDone;
+
+  @override
+  State<_RamCleanSheet> createState() => _RamCleanSheetState();
+}
+
+class _RamCleanSheetState extends State<_RamCleanSheet> {
+  int _phase = 0; // 0 = pilih level · 1 = berjalan · 2 = hasil
+  List<_RamStep> _steps = const [];
+  List<bool> _ok = const [];
+  int _stepIdx = -1;
+  int _beforeMb = 0, _freedMb = 0, _freeNowMb = 0;
+  Color _accent = kGreen;
+
+  static Future<int> _availMb() async {
+    final txt = await Sys.read('/proc/meminfo');
+    for (final l in txt.split('\n')) {
+      if (l.startsWith('MemAvailable')) {
+        final p = l.split(RegExp(r'\s+'));
+        if (p.length >= 2) return (int.tryParse(p[1]) ?? 0) ~/ 1024;
+      }
+    }
+    return 0;
+  }
+
+  Future<void> _run(RamCleanLevel lv) async {
+    if (!isRootNotifier.value) {
+      showSnack(context, '⚠ Butuh akses root untuk membersihkan RAM');
+      return;
+    }
+    if (lv == RamCleanLevel.menyeluruh) {
+      final ok = await confirmAction(context,
+          title: 'Bersih Menyeluruh',
+          message:
+              'Semua aplikasi pihak ketiga akan DITUTUP PAKSA. Musik, alarm, '
+              'dan notifikasi dari app lain bisa berhenti sampai app itu '
+              'dibuka lagi. Lanjutkan?',
+          accent: kRed);
+      if (!ok || !mounted) return;
+    }
+    final steps = switch (lv) {
+      RamCleanLevel.ringan => const [
+          _RamStep('Membuang page cache', _ramDropCmd),
+        ],
+      RamCleanLevel.sedang => const [
+          _RamStep('Menutup proses background', _ramKillAllCmd),
+          _RamStep('Membuang page cache', _ramDropCmd),
+        ],
+      RamCleanLevel.menyeluruh => const [
+          _RamStep('Menutup aplikasi pihak ketiga', _ramForceStopCmd),
+          _RamStep('Mematikan proses cached', _ramKillCachedCmd),
+          _RamStep('Menutup proses background', _ramKillAllCmd),
+          _RamStep('Membuang page cache', _ramDropCmd),
+        ],
+    };
+    HapticFeedback.mediumImpact();
+    setState(() {
+      _phase = 1;
+      _steps = steps;
+      _ok = List.filled(steps.length, false);
+      _stepIdx = 0;
+      _accent = switch (lv) {
+        RamCleanLevel.ringan => kGreen,
+        RamCleanLevel.sedang => kYellow,
+        RamCleanLevel.menyeluruh => kRed,
+      };
+    });
+    _beforeMb = await _availMb();
+    for (int i = 0; i < steps.length; i++) {
+      if (!mounted) return;
+      setState(() => _stepIdx = i);
+      final out = await Root.exec(steps[i].cmd);
+      if (!mounted) return;
+      setState(() => _ok[i] = !out.startsWith('ERR') && out != 'NO_ROOT');
+    }
+    // Beri waktu kernel menyelesaikan reclaim sebelum diukur ulang.
+    await Future.delayed(const Duration(milliseconds: 900));
+    final after = await _availMb();
+    if (!mounted) return;
+    setState(() {
+      _phase = 2;
+      _freeNowMb = after;
+      _freedMb = after - _beforeMb;
+      _stepIdx = _steps.length;
+    });
+    HapticFeedback.mediumImpact();
+    await widget.onDone?.call();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+              margin: const EdgeInsets.only(top: 10, bottom: 4),
+              width: 36,
+              height: 4,
+              decoration: BoxDecoration(
+                  color: mut(.2), borderRadius: BorderRadius.circular(2))),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(4, 10, 0, 14),
+            child: Row(children: [
+              Icon(Icons.memory_rounded,
+                  color: _phase == 0 ? kPurple : _accent, size: 19),
+              const SizedBox(width: 9),
+              Expanded(
+                  child: Text(
+                      _phase == 0
+                          ? 'Bersihkan RAM'
+                          : _phase == 1
+                              ? 'Membersihkan…'
+                              : 'Selesai',
+                      style: TextStyle(
+                          color: kWhite,
+                          fontSize: 16,
+                          fontWeight: FontWeight.w800))),
+              if (_phase != 1)
+                Tap(
+                    onTap: () => Navigator.pop(context),
+                    child: Padding(
+                        padding: const EdgeInsets.all(6),
+                        child: Icon(Icons.close_rounded,
+                            color: mut(.4), size: 20))),
+            ]),
+          ),
+          if (_phase == 0) ..._buildPicker(),
+          if (_phase == 1) _buildProgress(),
+          if (_phase == 2) _buildResult(),
+        ]),
+      ),
+    );
+  }
+
+  // ── fase 0: pilih tingkat ──
+  List<Widget> _buildPicker() => [
+        _levelRow(
+          RamCleanLevel.ringan,
+          Icons.cleaning_services_rounded,
+          kGreen,
+          'Ringan',
+          'Buang page cache — aman & instan',
+        ),
+        const SizedBox(height: 8),
+        _levelRow(
+          RamCleanLevel.sedang,
+          Icons.delete_sweep_rounded,
+          kYellow,
+          'Sedang',
+          'Tutup proses background + buang cache',
+        ),
+        const SizedBox(height: 8),
+        _levelRow(
+          RamCleanLevel.menyeluruh,
+          Icons.local_fire_department_rounded,
+          kRed,
+          'Menyeluruh',
+          'Tutup paksa SEMUA app lain sampai bersih — '
+          'musik/alarm/notifikasi app lain bisa berhenti',
+          danger: true,
+        ),
+        const SizedBox(height: 6),
+      ];
+
+  Widget _levelRow(RamCleanLevel lv, IconData icon, Color c, String title,
+          String desc,
+          {bool danger = false}) =>
+      Tap(
+        onTap: () => _run(lv),
+        child: Container(
+          padding: const EdgeInsets.all(13),
+          decoration: BoxDecoration(
+              color: mut(.04),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(
+                  color: danger
+                      ? kRed.withOpacity(.3)
+                      : kBorder.withOpacity(.6))),
+          child: Row(children: [
+            Container(
+                padding: const EdgeInsets.all(9),
+                decoration: BoxDecoration(
+                    color: c.withOpacity(.12),
+                    borderRadius: BorderRadius.circular(11)),
+                child: Icon(icon, color: c, size: 18)),
+            const SizedBox(width: 12),
+            Expanded(
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                  Row(children: [
+                    Text(title,
+                        style: TextStyle(
+                            color: kWhite,
+                            fontSize: 13.5,
+                            fontWeight: FontWeight.w700)),
+                    if (danger) ...[
+                      const SizedBox(width: 5),
+                      Icon(Icons.warning_amber_rounded,
+                          color: kRed.withOpacity(.8), size: 13),
+                    ],
+                  ]),
+                  const SizedBox(height: 2),
+                  Text(desc,
+                      style: TextStyle(
+                          color: mut(.38), fontSize: 10.5, height: 1.35)),
+                ])),
+            Icon(Icons.chevron_right_rounded, color: mut(.25), size: 20),
+          ]),
+        ),
+      );
+
+  // ── fase 1: checklist berjalan ──
+  Widget _buildProgress() => Column(children: [
+        for (int i = 0; i < _steps.length; i++)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: Row(children: [
+              SizedBox(
+                width: 18,
+                height: 18,
+                child: i < _stepIdx || (_stepIdx == i && _ok.length > i && _ok[i])
+                    ? Icon(
+                        _ok[i]
+                            ? Icons.check_circle_rounded
+                            : Icons.error_rounded,
+                        color: _ok[i] ? kGreen : kRed,
+                        size: 18)
+                    : i == _stepIdx
+                        ? CircularProgressIndicator(
+                            strokeWidth: 2, color: _accent)
+                        : Icon(Icons.circle_outlined,
+                            color: mut(.18), size: 16),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                  child: Text(_steps[i].label,
+                      style: TextStyle(
+                          color: i <= _stepIdx ? kWhite : mut(.35),
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w600))),
+            ]),
+          ),
+        const SizedBox(height: 4),
+        Text('Jangan tutup sheet ini…',
+            style: TextStyle(color: mut(.3), fontSize: 10.5)),
+        const SizedBox(height: 8),
+      ]);
+
+  // ── fase 2: hasil ──
+  Widget _buildResult() {
+    final gained = _freedMb > 0;
+    return Column(children: [
+      Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(vertical: 18),
+        decoration: BoxDecoration(
+            color: (gained ? kGreen : kYellow).withOpacity(.08),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+                color: (gained ? kGreen : kYellow).withOpacity(.25))),
+        child: Column(children: [
+          Text(gained ? '+$_freedMb MB' : 'RAM sudah lega',
+              style: TextStyle(
+                  color: gained ? kGreen : kYellow,
+                  fontSize: gained ? 28 : 16,
+                  fontWeight: FontWeight.w800,
+                  fontFamily: 'monospace')),
+          const SizedBox(height: 4),
+          Text(
+              gained
+                  ? 'RAM dibebaskan · Free sekarang: $_freeNowMb MB'
+                  : 'Tidak banyak yang bisa dibebaskan · Free: $_freeNowMb MB',
+              style: TextStyle(color: mut(.4), fontSize: 11)),
+        ]),
+      ),
+      const SizedBox(height: 10),
+      for (int i = 0; i < _steps.length; i++)
+        Padding(
+          padding: const EdgeInsets.only(bottom: 6),
+          child: Row(children: [
+            Icon(_ok[i] ? Icons.check_rounded : Icons.close_rounded,
+                color: _ok[i] ? kGreen : kRed, size: 14),
+            const SizedBox(width: 8),
+            Expanded(
+                child: Text(_steps[i].label,
+                    style: TextStyle(color: mut(.45), fontSize: 11))),
+          ]),
+        ),
+      const SizedBox(height: 8),
+      SizedBox(
+        width: double.infinity,
+        child: Tap(
+          onTap: () => Navigator.pop(context),
+          child: Container(
+            padding: const EdgeInsets.symmetric(vertical: 13),
+            decoration: BoxDecoration(
+                color: kGreen.withOpacity(.14),
+                borderRadius: BorderRadius.circular(13),
+                border: Border.all(color: kGreen.withOpacity(.35))),
+            child: Center(
+                child: Text('Selesai',
+                    style: TextStyle(
+                        color: kGreen,
+                        fontSize: 13.5,
+                        fontWeight: FontWeight.w800))),
+          ),
+        ),
+      ),
+    ]);
+  }
+}
+
 class DashStats {
   const DashStats({
     required this.ready,
@@ -1438,20 +1821,10 @@ class _DashboardTabState extends State<DashboardTab> {
     }
   }
 
-  /// Aksi cepat dari kartu RAM — bebaskan cache tanpa pindah tab.
-  Future<void> _clearCache() async {
-    if (!isRootNotifier.value) {
-      showSnack(context, '⚠ Butuh akses root untuk membersihkan cache');
-      return;
-    }
-    HapticFeedback.mediumImpact();
-    final out = await Root.exec('sync; echo 3 > /proc/sys/vm/drop_caches');
-    if (!mounted) return;
-    final err = out.startsWith('ERR') || out == 'NO_ROOT';
-    showSnack(context,
-        err ? '✗ ${_stripErr(out)}' : '✓ Cache dibersihkan — RAM dibebaskan');
-    if (!err) _tick();
-  }
+  /// Aksi cepat dari kartu RAM — buka sheet pembersih bertingkat, lalu
+  /// refresh statistik begitu selesai supaya bar RAM langsung turun.
+  Future<void> _clearCache() =>
+      showRamCleanSheet(context, onDone: () async => _tick());
 
   @override
   Widget build(BuildContext context) {
@@ -3081,20 +3454,20 @@ class _ChoiceGroupState extends State<_ChoiceGroup> {
 // ─────────────────────────────────────────────────────────────────────
 class _QuickAction {
   const _QuickAction(this.label, this.desc, this.icon, this.color, this.cmd,
-      {this.readOnly = false, this.danger = false});
+      {this.readOnly = false, this.danger = false, this.ramSheet = false});
   final String label, desc, cmd;
   final IconData icon;
   final Color color;
-  final bool readOnly, danger;
+  final bool readOnly, danger, ramSheet;
 }
 
 class _QuickActions extends StatelessWidget {
   const _QuickActions();
 
   static const List<_QuickAction> _actions = [
-    _QuickAction('Clear Cache', 'Bebaskan RAM',
-        Icons.cleaning_services_rounded, kGreen,
-        'sync; echo 3 > /proc/sys/vm/drop_caches'),
+    _QuickAction('Clear RAM', 'Cache · tutup app',
+        Icons.cleaning_services_rounded, kGreen, '',
+        ramSheet: true),
     _QuickAction('Baca Suhu', 'Semua zona', Icons.thermostat_rounded, kCyan,
         'for z in /sys/class/thermal/thermal_zone*; do t=\$(cat "\$z/temp" 2>/dev/null); n=\$(cat "\$z/type" 2>/dev/null); [ -n "\$t" ] && echo "\${n:-\$z}: \$t"; done',
         readOnly: true),
@@ -3142,6 +3515,10 @@ class _QuickTileState extends State<_QuickTile> {
   Future<void> _exec() async {
     final a = widget.a;
     if (_running) return;
+    if (a.ramSheet) {
+      await showRamCleanSheet(context);
+      return;
+    }
     if (a.danger) {
       final ok = await confirmAction(context,
           title: a.label,
