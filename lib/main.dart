@@ -1,5 +1,5 @@
 // ============================================================================
-//  XYZ_AI — COMMAND CENTER · v2.1 "OPTIMIZED"
+//  XYZ_AI — COMMAND CENTER · v2.2 "MATURE"
 //  main.dart — arsitektur single-file · Flutter murni (tanpa plugin native)
 // ============================================================================
 //
@@ -50,6 +50,27 @@
 //     dalam daftar yang sedang di-scroll. Fisik scroll memakai
 //     BouncingScrollPhysics agar gerakan terasa halus dan natural.
 //
+//  9. LAPIS PENGAMAN BERGANDA (v2.2)
+//     runZonedGuarded + FlutterError.onError menangkap error framework dan
+//     async yang tak terduga — satu widget gagal tidak merobohkan app.
+//     Setiap proses shell dibatasi timeout (aksi panjang seperti force-stop
+//     massal diberi batas khusus s/d 60 dtk). Setiap aksi destruktif
+//     (thermal off, reboot, deep clean) wajib lewat dialog konfirmasi, dan
+//     setiap perintah tulis dijaga guard anti-double-tap.
+//
+//  10. RAM CLEANER BERTINGKAT & TERUKUR (v2.2)
+//     Ringan (drop cache) / Sedang (+ am kill-all) / Menyeluruh (+ force-stop
+//     seluruh app pihak ketiga & kill proses cached adj>=900). App foreground
+//     otomatis dikecualikan — bila deteksinya gagal, tahap force-stop di-skip
+//     total demi keselamatan. Hasil dihitung dari MemAvailable asli (bukan
+//     estimasi), dan sheet terkunci (tap-luar, drag, tombol back) selama
+//     pipeline berjalan supaya tidak terputus di tengah.
+//
+//  11. POLL BERJENJANG TAB COMMAND (v2.2)
+//     Status live tiap grup setelan (governor, DNS, TCP, dll.) dibaca dengan
+//     jadwal berjenjang ~120 ms antar grup — membuka tab Command tidak
+//     memicu ledakan 10 proses shell sekaligus.
+//
 // ============================================================================
 
 import 'dart:async';
@@ -66,6 +87,13 @@ import 'package:flutter/services.dart';
 void main() {
   runZonedGuarded(() {
     WidgetsFlutterBinding.ensureInitialized();
+    // Jaring pengaman ganda: error framework (build/layout/paint) dicatat
+    // tanpa mematikan app; error async tak tertangkap jatuh ke handler zona
+    // di bawah. Satu widget yang gagal tidak boleh merobohkan seluruh app.
+    FlutterError.onError = (details) {
+      FlutterError.presentError(details);
+      debugPrint('FLUTTER ERROR: ${details.exceptionAsString()}');
+    };
     // Edge-to-edge modern: konten menggambar di belakang status & nav bar,
     // SafeArea yang mengatur jaraknya. Tampilan lebih premium di layar penuh.
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
@@ -1183,8 +1211,13 @@ class _RootShellState extends State<RootShell> {
 enum RamCleanLevel { ringan, sedang, menyeluruh }
 
 class _RamStep {
-  const _RamStep(this.label, this.cmd);
+  const _RamStep(this.label, this.cmd,
+      {this.timeout = const Duration(seconds: 15)});
   final String label, cmd;
+
+  /// Batas waktu per-tahap. Force-stop puluhan paket bisa makan 30+ detik —
+  /// timeout default Root.exec (8 dtk) akan memotong pipeline di tengah.
+  final Duration timeout;
 }
 
 const String _ramDropCmd = 'sync; echo 3 > /proc/sys/vm/drop_caches; echo OK';
@@ -1226,6 +1259,11 @@ Future<void> showRamCleanSheet(BuildContext context,
     context: context,
     backgroundColor: kPanel,
     isScrollControlled: true,
+    // Sheet TIDAK bisa ditutup dengan tap-luar/drag: proses pembersihan
+    // tidak boleh terputus di tengah. Tombol ✕ & tombol Selesai tetap ada
+    // di fase pilih & fase hasil.
+    isDismissible: false,
+    enableDrag: false,
     shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(22))),
     builder: (_) => _RamCleanSheet(onDone: onDone),
@@ -1246,6 +1284,7 @@ class _RamCleanSheetState extends State<_RamCleanSheet> {
   List<bool> _ok = const [];
   int _stepIdx = -1;
   int _beforeMb = 0, _freedMb = 0, _freeNowMb = 0;
+  bool _measured = false; // true bila meminfo terbaca sebelum & sesudah
   Color _accent = kGreen;
 
   static Future<int> _availMb() async {
@@ -1260,6 +1299,7 @@ class _RamCleanSheetState extends State<_RamCleanSheet> {
   }
 
   Future<void> _run(RamCleanLevel lv) async {
+    if (_phase != 0) return; // double-tap tidak boleh memicu dua pipeline
     if (!isRootNotifier.value) {
       showSnack(context, '⚠ Butuh akses root untuk membersihkan RAM');
       return;
@@ -1279,13 +1319,17 @@ class _RamCleanSheetState extends State<_RamCleanSheet> {
           _RamStep('Membuang page cache', _ramDropCmd),
         ],
       RamCleanLevel.sedang => const [
-          _RamStep('Menutup proses background', _ramKillAllCmd),
+          _RamStep('Menutup proses background', _ramKillAllCmd,
+              timeout: Duration(seconds: 20)),
           _RamStep('Membuang page cache', _ramDropCmd),
         ],
       RamCleanLevel.menyeluruh => const [
-          _RamStep('Menutup aplikasi pihak ketiga', _ramForceStopCmd),
-          _RamStep('Mematikan proses cached', _ramKillCachedCmd),
-          _RamStep('Menutup proses background', _ramKillAllCmd),
+          _RamStep('Menutup aplikasi pihak ketiga', _ramForceStopCmd,
+              timeout: Duration(seconds: 60)),
+          _RamStep('Mematikan proses cached', _ramKillCachedCmd,
+              timeout: Duration(seconds: 25)),
+          _RamStep('Menutup proses background', _ramKillAllCmd,
+              timeout: Duration(seconds: 20)),
           _RamStep('Membuang page cache', _ramDropCmd),
         ],
     };
@@ -1301,31 +1345,48 @@ class _RamCleanSheetState extends State<_RamCleanSheet> {
         RamCleanLevel.menyeluruh => kRed,
       };
     });
-    _beforeMb = await _availMb();
-    for (int i = 0; i < steps.length; i++) {
+    // Apa pun yang terjadi di dalam, sheet TIDAK BOLEH terkunci selamanya
+    // di fase "berjalan" — selalu berakhir di fase hasil.
+    try {
+      _beforeMb = await _availMb();
+      for (int i = 0; i < steps.length; i++) {
+        if (!mounted) return;
+        setState(() => _stepIdx = i);
+        final out = await Root.exec(steps[i].cmd, timeout: steps[i].timeout);
+        if (!mounted) return;
+        setState(() => _ok[i] = !out.startsWith('ERR') && out != 'NO_ROOT');
+      }
+      // Beri waktu kernel menyelesaikan reclaim sebelum diukur ulang.
+      await Future.delayed(const Duration(milliseconds: 900));
+      final after = await _availMb();
       if (!mounted) return;
-      setState(() => _stepIdx = i);
-      final out = await Root.exec(steps[i].cmd);
-      if (!mounted) return;
-      setState(() => _ok[i] = !out.startsWith('ERR') && out != 'NO_ROOT');
+      setState(() {
+        _phase = 2;
+        _measured = _beforeMb > 0 && after > 0;
+        _freeNowMb = after;
+        _freedMb = after - _beforeMb;
+        _stepIdx = _steps.length;
+      });
+      HapticFeedback.mediumImpact();
+      await widget.onDone?.call();
+    } catch (e) {
+      debugPrint('RamClean error: $e');
+      if (mounted) {
+        setState(() {
+          _phase = 2;
+          _measured = false;
+          _stepIdx = _steps.length;
+        });
+      }
     }
-    // Beri waktu kernel menyelesaikan reclaim sebelum diukur ulang.
-    await Future.delayed(const Duration(milliseconds: 900));
-    final after = await _availMb();
-    if (!mounted) return;
-    setState(() {
-      _phase = 2;
-      _freeNowMb = after;
-      _freedMb = after - _beforeMb;
-      _stepIdx = _steps.length;
-    });
-    HapticFeedback.mediumImpact();
-    await widget.onDone?.call();
   }
 
   @override
   Widget build(BuildContext context) {
-    return SafeArea(
+    // Tombol back sistem juga dikunci selama proses berjalan.
+    return WillPopScope(
+      onWillPop: () async => _phase != 1,
+      child: SafeArea(
       child: Padding(
         padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
         child: Column(mainAxisSize: MainAxisSize.min, children: [
@@ -1365,6 +1426,7 @@ class _RamCleanSheetState extends State<_RamCleanSheet> {
           if (_phase == 1) _buildProgress(),
           if (_phase == 2) _buildResult(),
         ]),
+      ),
       ),
     );
   }
@@ -1486,7 +1548,17 @@ class _RamCleanSheetState extends State<_RamCleanSheet> {
 
   // ── fase 2: hasil ──
   Widget _buildResult() {
-    final gained = _freedMb > 0;
+    final gained = _measured && _freedMb > 0;
+    final headline = gained
+        ? '+$_freedMb MB'
+        : _measured
+            ? 'RAM sudah lega'
+            : 'Selesai';
+    final sub = gained
+        ? 'RAM dibebaskan · Free sekarang: $_freeNowMb MB'
+        : _measured
+            ? 'Tidak banyak yang bisa dibebaskan · Free: $_freeNowMb MB'
+            : 'Pembersihan dijalankan — hasil tidak terukur';
     return Column(children: [
       Container(
         width: double.infinity,
@@ -1497,18 +1569,14 @@ class _RamCleanSheetState extends State<_RamCleanSheet> {
             border: Border.all(
                 color: (gained ? kGreen : kYellow).withOpacity(.25))),
         child: Column(children: [
-          Text(gained ? '+$_freedMb MB' : 'RAM sudah lega',
+          Text(headline,
               style: TextStyle(
                   color: gained ? kGreen : kYellow,
                   fontSize: gained ? 28 : 16,
                   fontWeight: FontWeight.w800,
                   fontFamily: 'monospace')),
           const SizedBox(height: 4),
-          Text(
-              gained
-                  ? 'RAM dibebaskan · Free sekarang: $_freeNowMb MB'
-                  : 'Tidak banyak yang bisa dibebaskan · Free: $_freeNowMb MB',
-              style: TextStyle(color: mut(.4), fontSize: 11)),
+          Text(sub, style: TextStyle(color: mut(.4), fontSize: 11)),
         ]),
       ),
       const SizedBox(height: 10),
@@ -3212,6 +3280,11 @@ class _ChoiceGroup extends StatefulWidget {
 }
 
 class _ChoiceGroupState extends State<_ChoiceGroup> {
+  /// Penjadwal berjenjang: 10 grup TIDAK menembakkan 10 proses shell
+  /// serentak saat tab Command dibuka — tiap grup diberi jeda ~120 ms
+  /// bertingkat, beban su/sh tersebar mulus tanpa lonjakan.
+  static int _staggerSeq = 0;
+
   String _current = '';   // key chip aktif ('' = belum diketahui)
   String _status = '';    // status live tambahan (mis. "Sinyal: LTE")
   bool _known = false;    // true begitu readCmd berhasil dibaca sekali
@@ -3220,6 +3293,8 @@ class _ChoiceGroupState extends State<_ChoiceGroup> {
   Timer? _timer;
   late final TabGate _gate;
   bool _polling = false;
+  bool _applying = false; // double-tap tidak boleh memicu dua perintah
+  bool _active = false;   // gate sedang menyala (tab terlihat + foreground)
 
   bool get _inHold =>
       _holdUntil != null && DateTime.now().isBefore(_holdUntil!);
@@ -3230,8 +3305,13 @@ class _ChoiceGroupState extends State<_ChoiceGroup> {
     _gate = TabGate(
       tab: 1,
       onChanged: (on) {
+        _active = on;
         if (on) {
-          _poll();
+          final delay =
+              Duration(milliseconds: (_staggerSeq++ % 10) * 120);
+          Future.delayed(delay, () {
+            if (mounted && _active) _poll();
+          });
           final s = widget.pollEvery;
           if (s != null) {
             _timer = Timer.periodic(Duration(seconds: s), (_) => _poll());
@@ -3291,38 +3371,43 @@ class _ChoiceGroupState extends State<_ChoiceGroup> {
 
   Future<void> _apply(_Choice c) async {
     final cmd = c.cmd;
-    if (cmd == null) return;
+    if (cmd == null || _applying) return;
     if (!isRootNotifier.value) {
       showSnack(context, '⚠ Butuh akses root untuk ${widget.label}');
       return;
     }
-    if (c.danger) {
-      final ok = await confirmAction(context,
-          title: '${widget.label}: ${c.label}',
-          message:
-              'Perintah ini berdampak besar pada sistem. Yakin melanjutkan?',
-          accent: widget.accent);
-      if (!ok || !mounted) return;
-    }
-    HapticFeedback.mediumImpact();
-    // Jendela proteksi SEBELUM eksekusi — chip langsung tersorot.
-    setState(() {
-      _held = c.key;
-      _holdUntil = DateTime.now().add(const Duration(seconds: 6));
-    });
-    final out = await Root.exec(cmd);
-    if (!mounted) return;
-    final err = out.startsWith('ERR');
-    showSnack(context,
-        err ? '✗ Gagal: ${_stripErr(out)}' : '✓ ${c.label} diterapkan');
-    if (err) {
+    _applying = true;
+    try {
+      if (c.danger) {
+        final ok = await confirmAction(context,
+            title: '${widget.label}: ${c.label}',
+            message:
+                'Perintah ini berdampak besar pada sistem. Yakin melanjutkan?',
+            accent: widget.accent);
+        if (!ok || !mounted) return;
+      }
+      HapticFeedback.mediumImpact();
+      // Jendela proteksi SEBELUM eksekusi — chip langsung tersorot.
       setState(() {
-        _held = null;
-        _holdUntil = null;
+        _held = c.key;
+        _holdUntil = DateTime.now().add(const Duration(seconds: 6));
       });
+      final out = await Root.exec(cmd);
+      if (!mounted) return;
+      final err = out.startsWith('ERR');
+      showSnack(context,
+          err ? '✗ Gagal: ${_stripErr(out)}' : '✓ ${c.label} diterapkan');
+      if (err) {
+        setState(() {
+          _held = null;
+          _holdUntil = null;
+        });
+      }
+      await Future.delayed(const Duration(milliseconds: 700));
+      if (mounted) _poll();
+    } finally {
+      _applying = false;
     }
-    await Future.delayed(const Duration(milliseconds: 700));
-    if (mounted) _poll();
   }
 
   @override
@@ -4062,7 +4147,7 @@ class AboutTab extends StatelessWidget {
                                     Icons.developer_board_rounded,
                                     kCyan),
                                 const SizedBox(width: 8),
-                                _chip('v2.1', Icons.rocket_launch_rounded,
+                                _chip('v2.2', Icons.rocket_launch_rounded,
                                     kPurple),
                               ]),
                         ])),
