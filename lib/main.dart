@@ -3775,30 +3775,45 @@ class _ChoiceGroupState extends State<_ChoiceGroup> {
       padding: const EdgeInsets.only(bottom: 10),
       child: Container(
         decoration: BoxDecoration(
-            color: kPanel,
-            borderRadius: BorderRadius.circular(20),
-            border: Border.all(color: kBorder)),
+          gradient: LinearGradient(
+            begin: Alignment.centerLeft,
+            end: Alignment.centerRight,
+            colors: [widget.accent.withOpacity(.05), kPanel],
+            stops: const [0, .4],
+          ),
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: widget.accent.withOpacity(.22)),
+          boxShadow: [
+            BoxShadow(
+                color: widget.accent.withOpacity(.06),
+                blurRadius: 16,
+                spreadRadius: -4),
+          ],
+        ),
         padding: const EdgeInsets.all(14),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Row(children: [
             Container(
-                padding: const EdgeInsets.all(10),
+                width: 40,
+                height: 40,
                 decoration: BoxDecoration(
-                    color: widget.accent.withOpacity(.12),
+                    color: widget.accent.withOpacity(.1),
                     borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: widget.accent.withOpacity(.2))),
-                child: Icon(widget.icon, color: widget.accent, size: 20)),
+                    border: Border.all(color: widget.accent.withOpacity(.35))),
+                child: Icon(widget.icon, color: widget.accent, size: 19)),
             const SizedBox(width: 12),
             Expanded(
                 child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                  Text(widget.label,
+                  Text(widget.label.toUpperCase(),
                       style: TextStyle(
                           color: kWhite,
-                          fontSize: 14,
-                          fontWeight: FontWeight.w700)),
-                  const SizedBox(height: 2),
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                          fontFamily: 'monospace',
+                          letterSpacing: .7)),
+                  const SizedBox(height: 3),
                   Row(children: [
                     Container(
                         width: 6,
@@ -3806,20 +3821,33 @@ class _ChoiceGroupState extends State<_ChoiceGroup> {
                         margin: const EdgeInsets.only(right: 5),
                         decoration: BoxDecoration(
                             shape: BoxShape.circle,
-                            color: unknown ? mut(.2) : kGreen)),
+                            color: unknown ? mut(.2) : kGreen,
+                            boxShadow: unknown
+                                ? null
+                                : [
+                                    BoxShadow(
+                                        color: kGreen.withOpacity(.6),
+                                        blurRadius: 4)
+                                  ])),
                     Expanded(
                         child: Text(statusTxt,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
-                            style:
-                                TextStyle(color: mut(.4), fontSize: 10.5))),
+                            style: TextStyle(
+                                color: mut(.4),
+                                fontSize: 10,
+                                fontFamily: 'monospace'))),
                   ]),
                 ])),
           ]),
           if (widget.note != null) ...[
-            const SizedBox(height: 6),
+            const SizedBox(height: 7),
             Text(widget.note!,
-                style: TextStyle(color: mut(.28), fontSize: 9.5, height: 1.3)),
+                style: TextStyle(
+                    color: mut(.28),
+                    fontSize: 9.5,
+                    fontFamily: 'monospace',
+                    height: 1.3)),
           ],
           const SizedBox(height: 12),
           Wrap(
@@ -3844,7 +3872,10 @@ class _ChoiceGroupState extends State<_ChoiceGroup> {
         decoration: BoxDecoration(
             color: on ? a.withOpacity(.16) : mut(.04),
             borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: on ? a : kBorder.withOpacity(.4))),
+            border: Border.all(color: on ? a : kBorder.withOpacity(.4)),
+            boxShadow: on
+                ? [BoxShadow(color: a.withOpacity(.25), blurRadius: 10)]
+                : null),
         child: Row(mainAxisSize: MainAxisSize.min, children: [
           if (on) ...[
             Icon(Icons.check_rounded, color: a, size: 13),
@@ -3858,17 +3889,20 @@ class _ChoiceGroupState extends State<_ChoiceGroup> {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(c.label,
+                Text(c.label.toUpperCase(),
                     style: TextStyle(
                         color: on ? a : kWhite,
-                        fontSize: 12,
-                        fontWeight: FontWeight.w700)),
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w700,
+                        fontFamily: 'monospace',
+                        letterSpacing: .4)),
                 if (c.sub != null) ...[
                   const SizedBox(height: 1),
                   Text(c.sub!,
                       style: TextStyle(
                           color: on ? a.withOpacity(.7) : mut(.32),
-                          fontSize: 9)),
+                          fontSize: 8.5,
+                          fontFamily: 'monospace')),
                 ],
               ]),
         ]),
@@ -4007,22 +4041,40 @@ class _QuickTileState extends State<_QuickTile> {
             curve: Motion.curve,
             padding: const EdgeInsets.symmetric(horizontal: 12),
             decoration: BoxDecoration(
-                color: _flash
-                    ? a.color.withOpacity(.18)
-                    : locked
-                        ? mut(.03)
-                        : kPanel,
-                borderRadius: BorderRadius.circular(16),
+                gradient: locked
+                    ? null
+                    : LinearGradient(
+                        begin: Alignment.centerLeft,
+                        end: Alignment.centerRight,
+                        colors: [
+                          (_flash ? a.color : a.color).withOpacity(.06),
+                          kPanel,
+                        ],
+                        stops: const [0, .5],
+                      ),
+                color: locked ? mut(.03) : null,
+                borderRadius: BorderRadius.circular(14),
                 border: Border.all(
-                    color: _flash ? a.color.withOpacity(.5) : kBorder)),
+                    color: _flash
+                        ? a.color.withOpacity(.6)
+                        : locked
+                            ? kBorder
+                            : a.color.withOpacity(.22)),
+                boxShadow: _flash
+                    ? [BoxShadow(color: a.color.withOpacity(.3), blurRadius: 14)]
+                    : null),
             child: Row(children: [
               Container(
-                  padding: const EdgeInsets.all(8),
+                  width: 34,
+                  height: 34,
                   decoration: BoxDecoration(
-                      color: (locked ? mut(.1) : a.color).withOpacity(.12),
-                      borderRadius: BorderRadius.circular(10)),
+                      color: (locked ? mut(.1) : a.color).withOpacity(.1),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                          color: (locked ? mut(.15) : a.color)
+                              .withOpacity(.3))),
                   child: Icon(locked ? Icons.lock_rounded : a.icon,
-                      color: locked ? mut(.3) : a.color, size: 17)),
+                      color: locked ? mut(.3) : a.color, size: 16)),
               const SizedBox(width: 10),
               Expanded(
                   child: Column(
@@ -4031,13 +4083,15 @@ class _QuickTileState extends State<_QuickTile> {
                       children: [
                     Row(children: [
                       Flexible(
-                          child: Text(a.label,
+                          child: Text(a.label.toUpperCase(),
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                               style: TextStyle(
                                   color: kWhite,
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w700))),
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w700,
+                                  fontFamily: 'monospace',
+                                  letterSpacing: .5))),
                       if (a.danger) ...[
                         const SizedBox(width: 4),
                         Icon(Icons.warning_amber_rounded,
@@ -4049,11 +4103,14 @@ class _QuickTileState extends State<_QuickTile> {
                             color: a.color.withOpacity(.55), size: 11),
                       ],
                     ]),
-                    const SizedBox(height: 1),
+                    const SizedBox(height: 2),
                     Text(a.desc,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: TextStyle(color: mut(.35), fontSize: 9.5)),
+                        style: TextStyle(
+                            color: mut(.35),
+                            fontSize: 9,
+                            fontFamily: 'monospace')),
                   ])),
             ]),
           ),
