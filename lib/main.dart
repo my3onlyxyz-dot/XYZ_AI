@@ -1,30 +1,310 @@
 // ═══════════════════════════════════════════════════════════════════
-//  DROP-IN REPLACEMENT — Xyz_AI Command Center
+//  Xyz_AI Command Center — main.dart LENGKAP (bisa langsung di-build)
 //
-//  Ganti dua kelas ini di main.dart:
-//    1. _BatteryCard      (blok lama ± baris 2371–2492)
-//    2. _SparklinePainter (blok lama ± baris 2516–2571)
+//  File sebelumnya yang di-commit ke repo ternyata hanya POTONGAN
+//  (drop-in 3 class) tanpa import / DashStats / konstanta / main().
+//  Itulah sebab semua error "Type 'StatelessWidget' not found" dst.
 //
-//  Nama, konstruktor, dan pemakaian TIDAK berubah — call site di
-//  Dashboard (hero card, RAM card, battery card) tidak perlu disentuh.
-//
-//  Yang distabilkan:
-//  • Seluruh isi kartu dibungkus ClipRRect → tidak ada paint yang bocor
-//    keluar radius kartu.
-//  • Sparkline dibungkus RepaintBoundary + ClipRect + IgnorePointer:
-//    repaint per-tick terkurung di lapisannya sendiri, murni dekorasi.
-//  • Band sparkline dinaikkan di atas label KAPASITAS — garis tidak lagi
-//    menimpa teks seperti strikethrough.
-//  • Painter menyisihkan margin sebesar radius glow → titik "sekarang"
-//    tidak pernah terpotong tepi canvas / nempel ke divider.
-//  • FIX BUG BEKU: riwayat dimutasi in-place oleh _push(), sehingga
-//    shouldRepaint lama selalu membandingkan list yang SAMA dan berhenti
-//    repaint begitu riwayat penuh (24 sampel). Painter kini menyimpan
-//    SNAPSHOT (List.of) dan membandingkan isi dengan listEquals.
-//    Fix ini otomatis berlaku juga untuk CPU hero card & RAM card.
-//  • Angka kapasitas dibungkus FittedBox → tidak overflow saat font
-//    scale sistem dibesarkan; teks kanan tetap ellipsis.
+//  File ini mandiri: import lengkap, konstanta warna, DashStats +
+//  poller statistik (baterai, RAM, CPU freq via root), kartu baterai
+//  stabil, sparkline anti-beku, dan kartu Perawatan Mata FUNGSI ASLI
+//  (settings put secure night_display_* via su).
 // ═══════════════════════════════════════════════════════════════════
+
+import 'dart:async';
+import 'dart:io';
+import 'dart:math' as math;
+
+import 'package:flutter/foundation.dart' show listEquals;
+import 'package:flutter/material.dart';
+
+// ─────────────────────────────────────────────────────────────────────
+// PALET WARNA
+// ─────────────────────────────────────────────────────────────────────
+const Color kBg = Color(0xFF0A0A0C);
+const Color kPanel = Color(0xFF141417);
+const Color kBorder = Color(0xFF26262B);
+const Color kWhite = Color(0xFFF2F2F5);
+const Color kRed = Color(0xFFFF3B30);
+const Color kGreen = Color(0xFF34C759);
+const Color kOrange = Color(0xFFFF9F0A);
+const Color kYellow = Color(0xFFFFD60A);
+
+/// Putih redup dengan opasitas [o] — dipakai untuk label sekunder.
+Color mut(double o) => kWhite.withOpacity(o);
+
+// ─────────────────────────────────────────────────────────────────────
+// UTIL ROOT
+// ─────────────────────────────────────────────────────────────────────
+Future<String> rootRun(String cmd) async {
+  final r = await Process.run('su', ['-c', cmd]);
+  if (r.exitCode != 0) {
+    final err = r.stderr.toString().trim();
+    throw Exception(err.isNotEmpty ? err : 'exit code ${r.exitCode}');
+  }
+  return r.stdout.toString().trim();
+}
+
+/// Baca file sistem: coba langsung dulu, kalau ditolak baru lewat su.
+Future<String?> readSys(String path) async {
+  try {
+    return (await File(path).readAsString()).trim();
+  } catch (_) {
+    try {
+      return await rootRun('cat $path');
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// DASH STATS — snapshot statistik + riwayat sparkline
+// ─────────────────────────────────────────────────────────────────────
+class DashStats {
+  // CPU
+  String cpuText = '---';
+  final List<double> freqHist = <double>[];
+
+  // RAM
+  String memText = '---';
+  final List<double> memHist = <double>[];
+
+  // Baterai
+  int? batPct;
+  String batStatus = '';
+  String batTempText = '---';
+  final List<double> batHist = <double>[];
+
+  String get batText => batPct == null ? '---' : '$batPct%';
+
+  static const int _histMax = 24;
+
+  void _push(List<double> hist, double v) {
+    hist.add(v);
+    if (hist.length > _histMax) hist.removeAt(0);
+  }
+
+  Future<void> refresh() async {
+    // ── Baterai ──
+    final cap =
+        await readSys('/sys/class/power_supply/battery/capacity');
+    final st = await readSys('/sys/class/power_supply/battery/status');
+    final tp = await readSys('/sys/class/power_supply/battery/temp');
+    batPct = cap == null ? null : int.tryParse(cap);
+    batStatus = st ?? '';
+    if (tp != null) {
+      final raw = double.tryParse(tp);
+      if (raw != null) {
+        // Node temp umumnya dalam persepuluh °C (mis. 342 = 34.2°C).
+        final c = raw > 100 ? raw / 10.0 : raw;
+        batTempText = '${c.toStringAsFixed(1)}°C';
+      }
+    }
+    if (batPct != null) _push(batHist, batPct!.toDouble());
+
+    // ── CPU: frekuensi cpu0 ──
+    final f = await readSys(
+        '/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq');
+    final khz = f == null ? null : double.tryParse(f);
+    if (khz != null) {
+      final mhz = khz / 1000.0;
+      cpuText = mhz >= 1000
+          ? '${(mhz / 1000).toStringAsFixed(2)} GHz'
+          : '${mhz.toStringAsFixed(0)} MHz';
+      _push(freqHist, mhz);
+    }
+
+    // ── RAM ──
+    final mi = await readSys('/proc/meminfo');
+    if (mi != null) {
+      int? grab(String key) {
+        final m = RegExp('$key:\\s+(\\d+)').firstMatch(mi);
+        return m == null ? null : int.tryParse(m.group(1)!);
+      }
+
+      final total = grab('MemTotal');
+      final avail = grab('MemAvailable');
+      if (total != null && avail != null && total > 0) {
+        final usedPct = (total - avail) / total * 100;
+        final usedGb = (total - avail) / 1048576.0;
+        memText = '${usedGb.toStringAsFixed(1)} GB';
+        _push(memHist, usedPct);
+      }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// APP
+// ─────────────────────────────────────────────────────────────────────
+void main() => runApp(const XyzApp());
+
+class XyzApp extends StatelessWidget {
+  const XyzApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Xyz_AI Command Center',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: kBg,
+        colorScheme: const ColorScheme.dark(
+            primary: kRed, secondary: kGreen, surface: kPanel),
+        useMaterial3: true,
+      ),
+      home: const DashboardPage(),
+    );
+  }
+}
+
+class DashboardPage extends StatefulWidget {
+  const DashboardPage({super.key});
+
+  @override
+  State<DashboardPage> createState() => _DashboardPageState();
+}
+
+class _DashboardPageState extends State<DashboardPage> {
+  final DashStats _stats = DashStats();
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _tick();
+    _timer = Timer.periodic(const Duration(seconds: 2), (_) => _tick());
+  }
+
+  Future<void> _tick() async {
+    await _stats.refresh();
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: kBg,
+        elevation: 0,
+        title: const Text('Command Center',
+            style: TextStyle(
+                color: kWhite, fontSize: 16, fontWeight: FontWeight.w800)),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(14),
+        children: [
+          Row(children: [
+            Expanded(
+                child: _StatCard(
+                    title: 'CPU',
+                    value: _stats.cpuText,
+                    icon: Icons.memory_rounded,
+                    color: kGreen,
+                    hist: _stats.freqHist)),
+            const SizedBox(width: 12),
+            Expanded(
+                child: _StatCard(
+                    title: 'RAM',
+                    value: _stats.memText,
+                    icon: Icons.storage_rounded,
+                    color: kOrange,
+                    hist: _stats.memHist)),
+          ]),
+          const SizedBox(height: 12),
+          _BatteryCard(_stats),
+          const SizedBox(height: 12),
+          const EyeCareCard(),
+        ],
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// KARTU STAT KECIL (CPU / RAM) dengan sparkline latar
+// ─────────────────────────────────────────────────────────────────────
+class _StatCard extends StatelessWidget {
+  const _StatCard(
+      {required this.title,
+      required this.value,
+      required this.icon,
+      required this.color,
+      required this.hist});
+
+  final String title;
+  final String value;
+  final IconData icon;
+  final Color color;
+  final List<double> hist;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 96,
+      decoration: BoxDecoration(
+          color: kPanel,
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: color.withOpacity(.18))),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(17),
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Stack(children: [
+            if (hist.length >= 2)
+              Positioned(
+                left: 0,
+                right: 0,
+                bottom: 12,
+                height: 22,
+                child: IgnorePointer(
+                  child: RepaintBoundary(
+                    child: ClipRect(
+                      child: CustomPaint(
+                          painter: _SparklinePainter(hist, color),
+                          size: Size.infinite),
+                    ),
+                  ),
+                ),
+              ),
+            Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Icon(icon, color: color, size: 15),
+              const Spacer(),
+              FittedBox(
+                fit: BoxFit.scaleDown,
+                alignment: Alignment.centerLeft,
+                child: Text(value,
+                    maxLines: 1,
+                    style: TextStyle(
+                        color: color,
+                        fontSize: 17,
+                        fontWeight: FontWeight.w800,
+                        fontFamily: 'monospace')),
+              ),
+              const SizedBox(height: 2),
+              Text(title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                      color: mut(.35),
+                      fontSize: 8.5,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 1.2)),
+            ]),
+          ]),
+        ),
+      ),
+    );
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // BATTERY — kapasitas + sparkline, suhu, dan status pengisian daya
@@ -102,17 +382,16 @@ class _BatteryCard extends StatelessWidget {
   }
 
   /// Panel kiri. Sparkline adalah LAPISAN LATAR yang terkurung:
-  /// • ClipRect     → goresan/glow tidak keluar area kiri (tidak nempel divider)
+  /// • ClipRect     → goresan/glow tidak keluar area kiri
   /// • RepaintBoundary → repaint per-tick tidak menyeret ikon & teks
   /// • IgnorePointer   → murni dekorasi, tidak mencuri sentuhan
-  /// Band diangkat setinggi label agar garis tidak menimpa 'KAPASITAS'.
   Widget _capacityPane(Color c, bool charging) {
     return Stack(children: [
       if (s.batHist.length >= 2)
         Positioned(
           left: 0,
           right: 0,
-          bottom: 14, // di atas label KAPASITAS (≈ tinggi label + jarak)
+          bottom: 14, // di atas label KAPASITAS
           height: 24,
           child: IgnorePointer(
             child: RepaintBoundary(
@@ -135,8 +414,7 @@ class _BatteryCard extends StatelessWidget {
                 color: c,
                 size: 15)),
         const Spacer(),
-        // FittedBox: angka mengecil sendiri bila ruang sempit / font
-        // scale sistem besar — tidak pernah overflow.
+        // FittedBox: angka mengecil sendiri bila ruang sempit.
         FittedBox(
           fit: BoxFit.scaleDown,
           alignment: Alignment.centerLeft,
@@ -164,8 +442,6 @@ class _BatteryCard extends StatelessWidget {
   Widget _mini(IconData icon, Color c, String label, String value) => Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Ikon disejajarkan ke baris label (bukan melayang di tengah
-          // dua baris teks).
           Padding(
               padding: const EdgeInsets.only(top: 1),
               child: Icon(icon, color: c, size: 14)),
@@ -198,13 +474,8 @@ class _BatteryCard extends StatelessWidget {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// SPARKLINE — grafik mini realtime kartu statistik. Auto-scale min-max
-// agar pergerakan kecil tetap terlihat; titik paling kanan = "sekarang".
-//
-// PENTING: riwayat asli (_freqHist/_memHist/_batHist) DIMUTASI in-place
-// oleh _push(). Painter menyimpan SNAPSHOT (List.of) supaya shouldRepaint
-// membandingkan data lama vs baru — bukan objek list yang sama. Tanpa
-// ini, sparkline berhenti repaint begitu riwayat penuh (24 sampel).
+// SPARKLINE — grafik mini realtime. Snapshot (List.of) + listEquals
+// agar shouldRepaint tetap bekerja saat riwayat dimutasi in-place.
 // ─────────────────────────────────────────────────────────────────────
 class _SparklinePainter extends CustomPainter {
   _SparklinePainter(List<double> source, this.color)
@@ -225,8 +496,8 @@ class _SparklinePainter extends CustomPainter {
     final maxV = data.reduce(math.max);
     final range = (maxV - minV).abs() < 0.001 ? 1.0 : (maxV - minV);
 
-    // Margin internal sebesar radius glow: titik "sekarang" dan ujung
-    // stroke tidak pernah terpotong tepi canvas.
+    // Margin internal sebesar radius glow: titik "sekarang" tidak
+    // pernah terpotong tepi canvas.
     final left = _glowR;
     final right = size.width - _glowR;
     final top = _glowR;
@@ -270,8 +541,9 @@ class _SparklinePainter extends CustomPainter {
           ..strokeCap = StrokeCap.round
           ..strokeJoin = StrokeJoin.round);
 
-    // Titik "sekarang" + glow — kini selalu utuh di dalam canvas.
-    canvas.drawCircle(points.last, _glowR, Paint()..color = color.withOpacity(.25));
+    // Titik "sekarang" + glow.
+    canvas.drawCircle(
+        points.last, _glowR, Paint()..color = color.withOpacity(.25));
     canvas.drawCircle(points.last, _dotR, Paint()..color = color);
   }
 
@@ -281,26 +553,17 @@ class _SparklinePainter extends CustomPainter {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  PERAWATAN MATA — kartu baru, FUNGSI ASLI (bukan cuma tampilan).
+//  PERAWATAN MATA — FUNGSI ASLI via root (settings put secure).
 //
-//  Menulis langsung ke Settings.Secure Android via root (su), yaitu
-//  key BAWAAN framework Android untuk fitur "Perawatan Mata" / Eye
-//  Comfort (di banyak ROM ini disebut Night Light di source code-nya,
-//  meskipun teksnya di-translate jadi "Perawatan Mata" — mesin di
-//  baliknya sama):
-//    night_display_activated          → 0/1        (on/off)
-//    night_display_auto_mode          → 0/1/2      (jadwal)
-//    night_display_color_temperature  → Kelvin     (intensitas)
+//  Key bawaan framework Android untuk fitur Perawatan Mata / Eye
+//  Comfort (mesinnya night display, teksnya di-translate ROM):
+//    night_display_activated          → 0/1     (on/off)
+//    night_display_auto_mode          → 0/1/2   (jadwal)
+//    night_display_color_temperature  → Kelvin  (intensitas)
 //
-//  CATATAN: kalau di HP kamu ROM-nya punya key SENDIRI yang berbeda
-//  (misal MIUI lama pernah pakai 'reading_mode' terpisah), jalankan:
-//     adb shell settings list secure | grep -i mata
-//     adb shell settings list secure | grep -i night
-//     adb shell settings list secure | grep -i reading
-//  lalu ganti tiga konstanta di _EyeCareKeys di bawah ini.
-//
-//  Butuh akses root (su) — sudah sesuai konteks app ini yang baca
-//  power_supply langsung.
+//  Kalau ROM kamu punya key sendiri, cek:
+//    adb shell settings list secure | grep -i night
+//  lalu ganti konstanta di _EyeCareKeys.
 // ═══════════════════════════════════════════════════════════════════
 class _EyeCareKeys {
   static const activated = 'night_display_activated';
@@ -317,8 +580,7 @@ class EyeCareCard extends StatefulWidget {
 
 class _EyeCareCardState extends State<EyeCareCard> {
   static const double _radius = 18;
-  // Rentang suhu warna umum AOSP night display. Sesuaikan kalau slider
-  // terasa mentok terlalu cepat / kurang jauh di HP kamu.
+  // Rentang suhu warna umum AOSP night display.
   static const int _tempCool = 6670; // paling "Dingin"
   static const int _tempWarm = 2596; // paling "Hangat"
 
@@ -334,28 +596,21 @@ class _EyeCareCardState extends State<EyeCareCard> {
     _readState();
   }
 
-  Future<String> _root(String cmd) async {
-    final r = await Process.run('su', ['-c', cmd]);
-    if (r.exitCode != 0) {
-      final err = r.stderr.toString().trim();
-      throw Exception(err.isNotEmpty ? err : 'exit code ${r.exitCode}');
-    }
-    return r.stdout.toString().trim();
-  }
-
   Future<void> _readState() async {
     try {
-      final a = await _root('settings get secure ${_EyeCareKeys.activated}');
-      final m = await _root('settings get secure ${_EyeCareKeys.autoMode}');
-      final t = await _root('settings get secure ${_EyeCareKeys.colorTemp}');
+      final a = await rootRun('settings get secure ${_EyeCareKeys.activated}');
+      final m = await rootRun('settings get secure ${_EyeCareKeys.autoMode}');
+      final t = await rootRun('settings get secure ${_EyeCareKeys.colorTemp}');
+      if (!mounted) return;
       setState(() {
-        _active = a.trim() == '1';
-        _autoMode = int.tryParse(m.trim()) ?? 0;
-        _temp = int.tryParse(t.trim()) ?? 4500;
+        _active = a == '1';
+        _autoMode = int.tryParse(m) ?? 0;
+        _temp = int.tryParse(t) ?? 4500;
         _loading = false;
         _error = null;
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _loading = false;
         _error = 'Butuh root untuk baca/atur setting ini.';
@@ -367,9 +622,10 @@ class _EyeCareCardState extends State<EyeCareCard> {
     final prev = _active;
     setState(() => _active = v);
     try {
-      await _root(
+      await rootRun(
           'settings put secure ${_EyeCareKeys.activated} ${v ? 1 : 0}');
     } catch (e) {
+      if (!mounted) return;
       setState(() => _active = prev);
       _toast('Gagal mengubah Perawatan Mata: $e');
     }
@@ -379,8 +635,9 @@ class _EyeCareCardState extends State<EyeCareCard> {
     final prev = _autoMode;
     setState(() => _autoMode = v);
     try {
-      await _root('settings put secure ${_EyeCareKeys.autoMode} $v');
+      await rootRun('settings put secure ${_EyeCareKeys.autoMode} $v');
     } catch (e) {
+      if (!mounted) return;
       setState(() => _autoMode = prev);
       _toast('Gagal mengubah jadwal: $e');
     }
@@ -388,7 +645,7 @@ class _EyeCareCardState extends State<EyeCareCard> {
 
   Future<void> _setTemp(int v) async {
     try {
-      await _root('settings put secure ${_EyeCareKeys.colorTemp} $v');
+      await rootRun('settings put secure ${_EyeCareKeys.colorTemp} $v');
     } catch (e) {
       _toast('Gagal mengubah intensitas: $e');
     }
@@ -462,7 +719,7 @@ class _EyeCareCardState extends State<EyeCareCard> {
                     if (_error != null) ...[
                       const SizedBox(height: 4),
                       Text(_error!,
-                          style: TextStyle(color: kRed, fontSize: 10.5)),
+                          style: const TextStyle(color: kRed, fontSize: 10.5)),
                     ],
                     const Divider(height: 20),
 
@@ -572,8 +829,9 @@ class _EyeCareCardState extends State<EyeCareCard> {
 
   Widget _scheduleTile(BuildContext ctx, int value, String label) => ListTile(
         title: Text(label, style: const TextStyle(color: kWhite)),
-        trailing:
-            _autoMode == value ? Icon(Icons.check_rounded, color: kRed) : null,
+        trailing: _autoMode == value
+            ? const Icon(Icons.check_rounded, color: kRed)
+            : null,
         onTap: () => Navigator.pop(ctx, value),
       );
 }
