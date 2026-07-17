@@ -1,10 +1,10 @@
 {
   "roots": [
-    "sahrul_control"
+    "xyz_ai"
   ],
   "packages": [
     {
-      "name": "sahrul_control",
+      "name": "xyz_ai",
       "version": "1.0.0+1",
       "dependencies": [
         "cupertino_icons",
