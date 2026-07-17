@@ -2509,8 +2509,16 @@ class _EyeCareQuickCard extends StatefulWidget {
 class _EyeCareQuickCardState extends State<_EyeCareQuickCard> {
   bool? _eyeCare; // null = belum terbaca
   bool? _dim;
+  double _dimLevel = 50; // 0..100 — makin besar makin redup
   bool _busyEye = false;
   bool _busyDim = false;
+  Timer? _dimDebounce;
+
+  @override
+  void dispose() {
+    _dimDebounce?.cancel();
+    super.dispose();
+  }
 
   @override
   void initState() {
@@ -2525,11 +2533,17 @@ class _EyeCareQuickCardState extends State<_EyeCareQuickCard> {
           'settings get secure night_display_activated 2>/dev/null'),
       Root.exec(
           'settings get secure reduce_bright_colors_activated 2>/dev/null'),
+      Root.exec(
+          'settings get secure reduce_bright_colors_level 2>/dev/null'),
     ]);
     if (!mounted) return;
     setState(() {
       _eyeCare = r[0].trim() == '1';
       _dim = r[1].trim() == '1';
+      final lvl = int.tryParse(r[2].trim());
+      if (lvl != null && lvl >= 0 && lvl <= 100) {
+        _dimLevel = lvl.toDouble();
+      }
     });
   }
 
@@ -2557,6 +2571,22 @@ class _EyeCareQuickCardState extends State<_EyeCareQuickCard> {
       setState(() => _dim = !v);
       showSnack(context, 'Gagal ubah Layar Redup — cek akses root.');
     }
+  }
+
+  /// Slider dipanggil puluhan kali per detik saat digeser — nilai lokal
+  /// diupdate instan (UI mulus), tapi penulisan ke sistem di-debounce
+  /// 200ms supaya tidak membanjiri shell dengan perintah `su -c`.
+  void _onDimLevelChanged(double v) {
+    setState(() => _dimLevel = v);
+    _dimDebounce?.cancel();
+    _dimDebounce = Timer(const Duration(milliseconds: 200), () async {
+      final r = await Root.exec(
+          'settings put secure reduce_bright_colors_level ${v.round()}; echo OK');
+      if (!mounted) return;
+      if (r == 'NO_ROOT' || r.startsWith('ERR') || r.startsWith('ERROR')) {
+        showSnack(context, 'Gagal ubah level redup — cek akses root.');
+      }
+    });
   }
 
   @override
@@ -2595,6 +2625,13 @@ class _EyeCareQuickCardState extends State<_EyeCareQuickCard> {
               busy: _busyDim,
               hasRoot: hasRoot,
               onChanged: _toggleDim,
+            ),
+            AnimatedSize(
+              duration: Motion.med,
+              curve: Motion.curve,
+              child: (hasRoot && (_dim ?? false))
+                  ? _dimLevelSlider()
+                  : const SizedBox(width: double.infinity),
             ),
           ]),
         );
@@ -2660,6 +2697,61 @@ class _EyeCareQuickCardState extends State<_EyeCareQuickCard> {
             onChanged: hasRoot ? onChanged : null,
             activeColor: color,
           ),
+      ]),
+    );
+  }
+
+  /// Slider intensitas Layar Redup (0 = nyaris tak terasa, 100 = paling
+  /// gelap). Label kiri/kanan meniru gaya "Dingin ↔ Hangat" pada Perawatan
+  /// Mata biar konsisten satu bahasa desain.
+  Widget _dimLevelSlider() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text('Tingkat Redup',
+                style: TextStyle(
+                    color: mut(.4),
+                    fontSize: 10.5,
+                    fontWeight: FontWeight.w600)),
+            Text('${_dimLevel.round()}%',
+                style: const TextStyle(
+                    color: kBlue,
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w800,
+                    fontFamily: 'monospace')),
+          ],
+        ),
+        SliderTheme(
+          data: SliderTheme.of(context).copyWith(
+            trackHeight: 3,
+            thumbShape:
+                const RoundSliderThumbShape(enabledThumbRadius: 8),
+            overlayShape:
+                const RoundSliderOverlayShape(overlayRadius: 16),
+            activeTrackColor: kBlue,
+            inactiveTrackColor: mut(.08),
+            thumbColor: kBlue,
+            overlayColor: kBlue.withOpacity(.16),
+          ),
+          child: Slider(
+            value: _dimLevel.clamp(0, 100),
+            min: 0,
+            max: 100,
+            onChanged: _onDimLevelChanged,
+          ),
+        ),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text('Ringan',
+                style: TextStyle(color: mut(.28), fontSize: 9.5)),
+            Text('Maksimal',
+                style: TextStyle(color: mut(.28), fontSize: 9.5)),
+          ],
+        ),
       ]),
     );
   }
