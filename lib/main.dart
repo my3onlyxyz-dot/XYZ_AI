@@ -1979,6 +1979,10 @@ class _DashboardTabState extends State<DashboardTab> {
                     s.ready ? _BatteryCard(s) : const _Skeleton(108),
               ),
             ),
+            const SizedBox(height: 18),
+            _sectionLabel('KENYAMANAN LAYAR', kOrange),
+            const SizedBox(height: 10),
+            const _EyeCareQuickCard(),
             const SizedBox(height: 24),
           ]),
         ),
@@ -2491,6 +2495,176 @@ class _BatteryCard extends StatelessWidget {
       ]);
 }
 
+/// Kartu pintasan Dashboard: dua sakelar paling sering dipakai —
+/// Mode Mata Sehat (night_display_activated) & Layar Redup
+/// (reduce_bright_colors_activated). Status dibaca sekali saat kartu
+/// tampil, lalu tiap toggle langsung menulis via Root.exec + optimistic
+/// UI (switch berubah duluan, dikoreksi lagi bila perintah gagal).
+class _EyeCareQuickCard extends StatefulWidget {
+  const _EyeCareQuickCard();
+  @override
+  State<_EyeCareQuickCard> createState() => _EyeCareQuickCardState();
+}
+
+class _EyeCareQuickCardState extends State<_EyeCareQuickCard> {
+  bool? _eyeCare; // null = belum terbaca
+  bool? _dim;
+  bool _busyEye = false;
+  bool _busyDim = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    if (!isRootNotifier.value) return;
+    final r = await Future.wait([
+      Root.exec(
+          'settings get secure night_display_activated 2>/dev/null'),
+      Root.exec(
+          'settings get secure reduce_bright_colors_activated 2>/dev/null'),
+    ]);
+    if (!mounted) return;
+    setState(() {
+      _eyeCare = r[0].trim() == '1';
+      _dim = r[1].trim() == '1';
+    });
+  }
+
+  Future<void> _toggleEye(bool v) async {
+    if (_busyEye) return;
+    setState(() { _eyeCare = v; _busyEye = true; }); // optimistic
+    final r = await Root.exec(
+        'settings put secure night_display_activated ${v ? 1 : 0}; echo OK');
+    if (!mounted) return;
+    setState(() => _busyEye = false);
+    if (r == 'NO_ROOT' || r.startsWith('ERR') || r.startsWith('ERROR')) {
+      setState(() => _eyeCare = !v); // rollback
+      showSnack(context, 'Gagal ubah Mode Mata Sehat — cek akses root.');
+    }
+  }
+
+  Future<void> _toggleDim(bool v) async {
+    if (_busyDim) return;
+    setState(() { _dim = v; _busyDim = true; });
+    final r = await Root.exec(
+        'settings put secure reduce_bright_colors_activated ${v ? 1 : 0}; echo OK');
+    if (!mounted) return;
+    setState(() => _busyDim = false);
+    if (r == 'NO_ROOT' || r.startsWith('ERR') || r.startsWith('ERROR')) {
+      setState(() => _dim = !v);
+      showSnack(context, 'Gagal ubah Layar Redup — cek akses root.');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<bool>(
+      valueListenable: isRootNotifier,
+      builder: (_, hasRoot, __) {
+        if (hasRoot && _eyeCare == null && _dim == null) {
+          // root baru aktif & belum sempat load — coba sekali lagi
+          WidgetsBinding.instance.addPostFrameCallback((_) => _load());
+        }
+        return Container(
+          decoration: BoxDecoration(
+            color: kPanel,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(color: kBorder),
+          ),
+          child: Column(children: [
+            _eyeCareRow(
+              icon: Icons.remove_red_eye_rounded,
+              color: kOrange,
+              title: 'Mode Mata Sehat',
+              sub: 'Layar kekuningan — nyaman malam hari',
+              value: _eyeCare,
+              busy: _busyEye,
+              hasRoot: hasRoot,
+              onChanged: _toggleEye,
+            ),
+            Divider(height: 1, color: kBorder, indent: 62, endIndent: 16),
+            _eyeCareRow(
+              icon: Icons.brightness_low_rounded,
+              color: kBlue,
+              title: 'Layar Redup',
+              sub: 'Lebih redup dari kecerahan minimum',
+              value: _dim,
+              busy: _busyDim,
+              hasRoot: hasRoot,
+              onChanged: _toggleDim,
+            ),
+          ]),
+        );
+      },
+    );
+  }
+
+  Widget _eyeCareRow({
+    required IconData icon,
+    required Color color,
+    required String title,
+    required String sub,
+    required bool? value,
+    required bool busy,
+    required bool hasRoot,
+    required ValueChanged<bool> onChanged,
+  }) {
+    final on = value ?? false;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      child: Row(children: [
+        Container(
+          width: 40,
+          height: 40,
+          decoration: BoxDecoration(
+            color: on ? color.withOpacity(.16) : mut(.05),
+            borderRadius: BorderRadius.circular(11),
+          ),
+          child: Icon(icon, size: 19, color: on ? color : mut(.4)),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title,
+                  style: TextStyle(
+                      color: kWhite,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700)),
+              const SizedBox(height: 2),
+              Text(
+                !hasRoot ? 'Butuh akses root' : sub,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                    color: !hasRoot ? kRed.withOpacity(.7) : mut(.35),
+                    fontSize: 10.5),
+              ),
+            ],
+          ),
+        ),
+        if (busy)
+          SizedBox(
+            width: 20,
+            height: 20,
+            child: CircularProgressIndicator(
+                strokeWidth: 2, color: color.withOpacity(.7)),
+          )
+        else
+          Switch(
+            value: on,
+            onChanged: hasRoot ? onChanged : null,
+            activeColor: color,
+          ),
+      ]),
+    );
+  }
+}
+
 /// Placeholder loading dengan tinggi eksplisit — layout tidak "loncat"
 /// saat data pertama masuk.
 class _Skeleton extends StatelessWidget {
@@ -2637,6 +2811,7 @@ class CommandTab extends StatelessWidget {
                   _dt2wGroup(),
                   _nightLightGroup(),
                   _nightLightTempGroup(),
+                  _extraDimGroup(),
 
                   const SizedBox(height: 8),
                   // ── AKSI CEPAT ──────────────────────────────────────
@@ -2942,6 +3117,31 @@ class CommandTab extends StatelessWidget {
           _Choice('warm', 'Hangat', sub: '~1800K — paling kekuningan',
               cmd:
                   'settings put secure night_display_color_temperature 1800; echo OK'),
+        ],
+      );
+
+  // ── Ekstra Redup (Reduce Bright Colors) — meredupkan layar melebihi
+  //    batas kecerahan minimum hardware. Fitur bawaan Android, dikontrol
+  //    lewat Secure Settings yang sama seperti menu Aksesibilitas. ──
+  _ChoiceGroup _extraDimGroup() => _ChoiceGroup(
+        icon: Icons.brightness_low_rounded,
+        label: 'Ekstra Redup',
+        accent: kBlue,
+        note: 'Layar lebih redup dari kecerahan minimum ponsel.',
+        readCmd:
+            'settings get secure reduce_bright_colors_activated 2>/dev/null',
+        parse: (r) => r == '1'
+            ? 'on'
+            : (r == '0' || r == 'null' || r.isEmpty || r == 'OK')
+                ? 'off'
+                : '',
+        choices: const [
+          _Choice('on', 'Aktif', sub: 'Redupkan layar lebih jauh',
+              cmd:
+                  'settings put secure reduce_bright_colors_activated 1; echo OK'),
+          _Choice('off', 'Nonaktif', sub: 'Kecerahan normal',
+              cmd:
+                  'settings put secure reduce_bright_colors_activated 0; echo OK'),
         ],
       );
 
