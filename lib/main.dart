@@ -1,5 +1,5 @@
 // ============================================================================
-//  XYZ_AI — COMMAND CENTER · v2.2 "MATURE"
+//  XYZ_AI — COMMAND CENTER · v2.3 "ARMOR"
 //  main.dart — arsitektur single-file · Flutter murni (tanpa plugin native)
 // ============================================================================
 //
@@ -71,6 +71,23 @@
 //     jadwal berjenjang ~120 ms antar grup — membuka tab Command tidak
 //     memicu ledakan 10 proses shell sekaligus.
 //
+//  12. LAPIS ANTI-KERNEL-PANIC (v2.3 "ARMOR")
+//      a) Semua perintah TULIS berjalan lewat Root.write: antrean SERIAL
+//         (tidak ada dua tulisan kernel yang balapan) + prelude guard.
+//      b) Prelude guard: helper `w PATH VAL` hanya menulis bila node ada
+//         dan writable — tidak pernah menembak node yang tidak eksis; dan
+//         `sync` dijalankan lebih dulu supaya data user aman di disk
+//         sebelum kernel disentuh.
+//      c) Skrip frekuensi tetap memegang aturan urutan (min diturunkan
+//         dulu saat menurunkan max; reset menulis max dulu baru min).
+//      d) DT2W tetap via settings — node hardware TIDAK pernah disentuh.
+//
+//  13. WARNA SEMANTIK PER-OPSI (v2.3)
+//      Setiap chip pilihan kini punya warna khasnya sendiri (accent per
+//      _Choice): governor performance merah / powersave hijau, tier
+//      frekuensi bergradasi panas→hemat, DNS mengikuti warna brand,
+//      toggle Aktif hijau / Mati merah untuk aksi berisiko. Chip yang
+//      belum aktif menampilkan titik kecil warna identitasnya.
 // ============================================================================
 
 import 'dart:async';
@@ -187,6 +204,33 @@ class Root {
     } catch (_) {
       return false;
     }
+  }
+
+  /// ── LAPIS ANTI-KERNEL-PANIC #1: ANTREAN SERIAL ──
+  /// Semua perintah TULIS root dieksekusi SATU-PER-SATU lewat rantai Future.
+  /// Dua tulisan sysfs tidak pernah balapan (mis. thermal off + freq tier
+  /// diketuk hampir bersamaan) — kondisi race pada node kernel adalah salah
+  /// satu pemicu klasik panic/reboot.
+  static Future<void> _writeQueue = Future.value();
+
+  /// ── LAPIS ANTI-KERNEL-PANIC #2: PRELUDE GUARD ──
+  /// Disuntikkan di depan setiap perintah tulis:
+  ///  * `w PATH VAL` — tulis HANYA bila node ada & bisa ditulis; gagal
+  ///    senyap (return 1), tidak pernah menembak node yang tidak ada.
+  ///  * `sync` — flush filesystem SEBELUM menyentuh kernel; kalaupun
+  ///    terjadi hal terburuk, data user sudah aman di disk.
+  static const String guard =
+      'w(){ [ -e "\$1" ] && [ -w "\$1" ] || return 1; '
+      'echo "\$2" > "\$1" 2>/dev/null || return 1; }; sync; ';
+
+  /// Jalankan perintah TULIS sysfs/kernel dengan bungkus penuh:
+  /// prelude guard + antrean serial + timeout. SEMUA aksi yang menyentuh
+  /// node kernel wajib lewat sini, bukan [exec] mentah.
+  static Future<String> write(String cmd,
+      {Duration timeout = const Duration(seconds: 8)}) {
+    final task = _writeQueue.then((_) => exec(guard + cmd, timeout: timeout));
+    _writeQueue = task.then((_) {}, onError: (_) {});
+    return task;
   }
 
   /// Jalankan [cmd] sebagai root. Mengembalikan:
@@ -1220,7 +1264,9 @@ class _RamStep {
   final Duration timeout;
 }
 
-const String _ramDropCmd = 'sync; echo 3 > /proc/sys/vm/drop_caches; echo OK';
+// Dieksekusi via Root.write → prelude sudah menyediakan helper `w` + sync.
+const String _ramDropCmd =
+    'w /proc/sys/vm/drop_caches 3 && echo OK || echo "ERR: drop_caches ditolak"';
 
 const String _ramKillAllCmd = 'am kill-all; echo OK';
 
@@ -1352,7 +1398,9 @@ class _RamCleanSheetState extends State<_RamCleanSheet> {
       for (int i = 0; i < steps.length; i++) {
         if (!mounted) return;
         setState(() => _stepIdx = i);
-        final out = await Root.exec(steps[i].cmd, timeout: steps[i].timeout);
+        // Root.write: sync + guard sebelum drop_caches/kill — tulisan kernel
+        // paling berat di app ini berjalan serial & terlindungi.
+        final out = await Root.write(steps[i].cmd, timeout: steps[i].timeout);
         if (!mounted) return;
         setState(() => _ok[i] = !out.startsWith('ERR') && out != 'NO_ROOT');
       }
@@ -2932,6 +2980,16 @@ class CommandTab extends StatelessWidget {
       'conservative': 'Naik pelan',
       'interactive': 'Responsif UI',
     };
+    // Warna semantik per-governor: merah = ngebut, hijau = hemat,
+    // cyan = harian, dst — sekali lihat langsung paham karakternya.
+    const tint = {
+      'performance': kRed,
+      'powersave': kGreen,
+      'schedutil': kCyan,
+      'ondemand': kOrange,
+      'conservative': kTeal,
+      'interactive': kBlue,
+    };
     return _ChoiceGroup(
       icon: Icons.developer_board_rounded,
       label: 'CPU Governor',
@@ -2943,8 +3001,9 @@ class CommandTab extends StatelessWidget {
         for (final g in govs)
           _Choice(g, g,
               sub: sub[g],
+              accent: tint[g],
               cmd:
-                  'ok=0; for f in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do echo $g > "\$f" 2>/dev/null && ok=1; done; [ \$ok -eq 1 ] && echo OK || echo "ERR: gagal menulis governor"'),
+                  'ok=0; for f in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do w "\$f" $g && ok=1; done; [ \$ok -eq 1 ] && echo OK || echo "ERR: gagal menulis governor"'),
       ],
     );
   }
@@ -2973,11 +3032,16 @@ class CommandTab extends StatelessWidget {
         if (p >= 50) return '60';
         return '40';
       },
+      // Gradasi warna mengikuti "suhu" tier: merah (full) → hijau (hemat).
       choices: [
-        const _Choice('100', 'Full', sub: '100% — default', cmd: _resetFreqCmd),
-        _Choice('80', 'Tinggi', sub: '±80% tiap cluster', cmd: _tierCmd(80)),
-        _Choice('60', 'Seimbang', sub: '±60% — adem', cmd: _tierCmd(60)),
-        _Choice('40', 'Hemat', sub: '±40% — baterai', cmd: _tierCmd(40)),
+        const _Choice('100', 'Full',
+            sub: '100% — default', accent: kRed, cmd: _resetFreqCmd),
+        _Choice('80', 'Tinggi',
+            sub: '±80% tiap cluster', accent: kOrange, cmd: _tierCmd(80)),
+        _Choice('60', 'Seimbang',
+            sub: '±60% — adem', accent: kTeal, cmd: _tierCmd(60)),
+        _Choice('40', 'Hemat',
+            sub: '±40% — baterai', accent: kGreen, cmd: _tierCmd(40)),
       ],
     );
   }
@@ -2995,12 +3059,13 @@ class CommandTab extends StatelessWidget {
                 ? 'on'
                 : '',
         choices: const [
-          _Choice('on', 'Aktif', sub: 'Aman — default',
+          _Choice('on', 'Aktif', sub: 'Aman — default', accent: kGreen,
               cmd:
-                  'ok=0; for m in /sys/class/thermal/thermal_zone*/mode; do echo enabled > "\$m" 2>/dev/null && ok=1; done; [ \$ok -eq 1 ] && echo OK || echo "ERR: node mode tidak tersedia"'),
+                  'ok=0; for m in /sys/class/thermal/thermal_zone*/mode; do w "\$m" enabled && ok=1; done; [ \$ok -eq 1 ] && echo OK || echo "ERR: node mode tidak tersedia"'),
           _Choice('off', 'Mati', sub: 'Tanpa throttle', danger: true,
+              accent: kRed,
               cmd:
-                  'ok=0; for m in /sys/class/thermal/thermal_zone*/mode; do echo disabled > "\$m" 2>/dev/null && ok=1; done; [ \$ok -eq 1 ] && echo OK || echo "ERR: node mode tidak tersedia"'),
+                  'ok=0; for m in /sys/class/thermal/thermal_zone*/mode; do w "\$m" disabled && ok=1; done; [ \$ok -eq 1 ] && echo OK || echo "ERR: node mode tidak tersedia"'),
         ],
       );
 
@@ -3036,10 +3101,13 @@ class CommandTab extends StatelessWidget {
         },
         choices: [
           _Choice('5g', '5G Preferred',
-              sub: 'NR/LTE — jangkauan penuh', cmd: _netCmd(26)),
-          _Choice('4g', '4G Only', sub: 'LTE saja — stabil', cmd: _netCmd(11)),
+              sub: 'NR/LTE — jangkauan penuh',
+              accent: kPurple,
+              cmd: _netCmd(26)),
+          _Choice('4g', '4G Only',
+              sub: 'LTE saja — stabil', accent: kBlue, cmd: _netCmd(11)),
           _Choice('4g3g', '4G/3G',
-              sub: 'LTE + fallback WCDMA', cmd: _netCmd(9)),
+              sub: 'LTE + fallback WCDMA', accent: kTeal, cmd: _netCmd(9)),
         ],
       );
 
@@ -3064,14 +3132,20 @@ class CommandTab extends StatelessWidget {
           if (s.contains('dns.google')) return 'g';
           return '';
         },
+        // Warna mengikuti identitas brand tiap provider.
         choices: [
           _Choice('adguard', 'AdGuard',
-              sub: 'Blokir iklan', cmd: _dnsCmd('dns.adguard-dns.com')),
+              sub: 'Blokir iklan',
+              accent: kGreen,
+              cmd: _dnsCmd('dns.adguard-dns.com')),
           _Choice('cf', 'Cloudflare',
-              sub: '1.1.1.1', cmd: _dnsCmd('one.one.one.one')),
+              sub: '1.1.1.1', accent: kOrange, cmd: _dnsCmd('one.one.one.one')),
           _Choice('q9', 'Quad9',
-              sub: 'Anti-malware', cmd: _dnsCmd('dns.quad9.net')),
-          _Choice('g', 'Google', sub: '8.8.8.8', cmd: _dnsCmd('dns.google')),
+              sub: 'Anti-malware',
+              accent: kPurple,
+              cmd: _dnsCmd('dns.quad9.net')),
+          _Choice('g', 'Google',
+              sub: '8.8.8.8', accent: kBlue, cmd: _dnsCmd('dns.google')),
           const _Choice('off', 'Off',
               sub: 'Otomatis',
               cmd: 'settings put global private_dns_mode off; echo OK'),
@@ -3088,12 +3162,14 @@ class CommandTab extends StatelessWidget {
         choices: const [
           _Choice('bbr', 'BBR',
               sub: 'Algoritma Google',
+              accent: kGreen,
               cmd:
-                  'echo bbr > /proc/sys/net/ipv4/tcp_congestion_control && echo OK || echo "ERR: bbr tidak tersedia di kernel"'),
+                  'w /proc/sys/net/ipv4/tcp_congestion_control bbr && echo OK || echo "ERR: bbr tidak tersedia di kernel"'),
           _Choice('cubic', 'Cubic',
               sub: 'Default Linux',
+              accent: kBlue,
               cmd:
-                  'echo cubic > /proc/sys/net/ipv4/tcp_congestion_control && echo OK || echo "ERR: gagal menulis"'),
+                  'w /proc/sys/net/ipv4/tcp_congestion_control cubic && echo OK || echo "ERR: gagal menulis"'),
         ],
       );
 
@@ -3105,10 +3181,12 @@ class CommandTab extends StatelessWidget {
         readCmd: 'cat /proc/sys/vm/swappiness 2>/dev/null',
         parse: (r) => (r == '10' || r == '60') ? r : '',
         choices: const [
-          _Choice('10', '10', sub: 'Prioritaskan RAM',
-              cmd: 'echo 10 > /proc/sys/vm/swappiness && echo OK'),
-          _Choice('60', '60', sub: 'Seimbang — default',
-              cmd: 'echo 60 > /proc/sys/vm/swappiness && echo OK'),
+          _Choice('10', '10', sub: 'Prioritaskan RAM', accent: kCyan,
+              cmd:
+                  'w /proc/sys/vm/swappiness 10 && echo OK || echo "ERR: gagal menulis"'),
+          _Choice('60', '60', sub: 'Seimbang — default', accent: kPurple,
+              cmd:
+                  'w /proc/sys/vm/swappiness 60 && echo OK || echo "ERR: gagal menulis"'),
         ],
       );
 
@@ -3130,12 +3208,14 @@ class CommandTab extends StatelessWidget {
         choices: const [
           _Choice('noop', 'Noop / None',
               sub: 'Overhead minimal',
+              accent: kTeal,
               cmd:
-                  'ok=0; for d in /sys/block/*/queue/scheduler; do { echo noop > "\$d" 2>/dev/null || echo none > "\$d" 2>/dev/null; } && ok=1; done; [ \$ok -eq 1 ] && echo OK || echo "ERR: scheduler tidak tersedia"'),
+                  'ok=0; for d in /sys/block/*/queue/scheduler; do { w "\$d" noop || w "\$d" none; } && ok=1; done; [ \$ok -eq 1 ] && echo OK || echo "ERR: scheduler tidak tersedia"'),
           _Choice('deadline', 'Deadline',
               sub: 'Responsif I/O',
+              accent: kOrange,
               cmd:
-                  'ok=0; for d in /sys/block/*/queue/scheduler; do { echo deadline > "\$d" 2>/dev/null || echo mq-deadline > "\$d" 2>/dev/null; } && ok=1; done; [ \$ok -eq 1 ] && echo OK || echo "ERR: scheduler tidak tersedia"'),
+                  'ok=0; for d in /sys/block/*/queue/scheduler; do { w "\$d" deadline || w "\$d" mq-deadline; } && ok=1; done; [ \$ok -eq 1 ] && echo OK || echo "ERR: scheduler tidak tersedia"'),
         ],
       );
 
@@ -3155,6 +3235,7 @@ class CommandTab extends StatelessWidget {
                 : '',
         choices: const [
           _Choice('on', 'Aktif', sub: 'Ketuk 2x → layar nyala',
+              accent: kGreen,
               cmd: 'settings put system os_action_tapping_wake 1; echo OK'),
           _Choice('off', 'Mati', sub: 'Gesture dimatikan',
               cmd: 'settings put system os_action_tapping_wake 0; echo OK'),
@@ -3176,6 +3257,7 @@ class CommandTab extends StatelessWidget {
                 : '',
         choices: const [
           _Choice('on', 'Aktif', sub: 'Filter cahaya biru menyala',
+              accent: kGreen,
               cmd: 'settings put secure night_display_activated 1; echo OK'),
           _Choice('off', 'Nonaktif', sub: 'Warna layar normal',
               cmd: 'settings put secure night_display_activated 0; echo OK'),
@@ -3201,12 +3283,15 @@ class CommandTab extends StatelessWidget {
         },
         choices: const [
           _Choice('cold', 'Dingin', sub: '~4500K — perubahan minim',
+              accent: kBlue,
               cmd:
                   'settings put secure night_display_color_temperature 4500; echo OK'),
           _Choice('mid', 'Sedang', sub: '~3000K — seimbang',
+              accent: kOrange,
               cmd:
                   'settings put secure night_display_color_temperature 3000; echo OK'),
           _Choice('warm', 'Hangat', sub: '~1800K — paling kekuningan',
+              accent: kRed,
               cmd:
                   'settings put secure night_display_color_temperature 1800; echo OK'),
         ],
@@ -3229,6 +3314,7 @@ class CommandTab extends StatelessWidget {
                 : '',
         choices: const [
           _Choice('on', 'Aktif', sub: 'Redupkan layar lebih jauh',
+              accent: kGreen,
               cmd:
                   'settings put secure reduce_bright_colors_activated 1; echo OK'),
           _Choice('off', 'Nonaktif', sub: 'Kecerahan normal',
@@ -3267,9 +3353,9 @@ for pol in /sys/devices/system/cpu/cpufreq/policy*; do
   [ -n "\$best" ] || best=\$want
   curmin=\$(cat "\$pol/scaling_min_freq" 2>/dev/null)
   if [ -n "\$curmin" ] && [ "\$curmin" -gt "\$best" ]; then
-    echo "\$hwmin" > "\$pol/scaling_min_freq"
+    w "\$pol/scaling_min_freq" "\$hwmin"
   fi
-  echo "\$best" > "\$pol/scaling_max_freq" && ok=1
+  w "\$pol/scaling_max_freq" "\$best" && ok=1
 done
 [ \$ok -eq 1 ] && echo OK || echo "ERR: tidak ada policy yang bisa ditulis"
 ''';
@@ -3280,8 +3366,8 @@ ok=0
 for pol in /sys/devices/system/cpu/cpufreq/policy*; do
   hwmax=\$(cat "\$pol/cpuinfo_max_freq" 2>/dev/null); [ -n "\$hwmax" ] || continue
   hwmin=\$(cat "\$pol/cpuinfo_min_freq" 2>/dev/null)
-  echo "\$hwmax" > "\$pol/scaling_max_freq" && ok=1
-  [ -n "\$hwmin" ] && echo "\$hwmin" > "\$pol/scaling_min_freq"
+  w "\$pol/scaling_max_freq" "\$hwmax" && ok=1
+  [ -n "\$hwmin" ] && w "\$pol/scaling_min_freq" "\$hwmin"
 done
 [ \$ok -eq 1 ] && echo OK || echo "ERR: policy tidak ditemukan"
 ''';
@@ -3463,7 +3549,7 @@ class _RefreshRateGroupState extends State<_RefreshRateGroup> {
     });
     // peak = min ke Hz yang sama menutup celah sistem menaik-turunkan
     // sendiri; key MIUI/user ikut ditulis untuk kompatibilitas lintas ROM.
-    final out = await Root.exec('''
+    final out = await Root.write('''
 settings put system peak_refresh_rate $hz.0
 settings put system min_refresh_rate $hz.0
 settings put system user_refresh_rate $hz
@@ -3587,12 +3673,14 @@ echo OK''');
 //                tab terlihat & sesudah apply — hemat proses shell.
 // ─────────────────────────────────────────────────────────────────────
 class _Choice {
-  const _Choice(this.key, this.label, {this.sub, this.cmd, this.danger = false});
+  const _Choice(this.key, this.label,
+      {this.sub, this.cmd, this.danger = false, this.accent});
   final String key;    // identitas — dicocokkan dengan hasil readCmd
   final String label;  // teks chip
   final String? sub;   // subteks kecil di bawah label
   final String? cmd;   // shell yang dijalankan saat chip diketuk
   final bool danger;   // minta konfirmasi dulu
+  final Color? accent; // warna khas opsi ini — null = ikut warna grup
 }
 
 class _ChoiceGroup extends StatefulWidget {
@@ -3737,7 +3825,10 @@ class _ChoiceGroupState extends State<_ChoiceGroup> {
         _held = c.key;
         _holdUntil = DateTime.now().add(const Duration(seconds: 6));
       });
-      final out = await Root.exec(cmd);
+      // Semua tulisan lewat Root.write: prelude guard (w + sync) dan
+      // antrean serial — dua chip diketuk beruntun tidak akan balapan
+      // menulis node kernel.
+      final out = await Root.write(cmd);
       if (!mounted) return;
       final err = out.startsWith('ERR');
       showSnack(context,
@@ -3862,7 +3953,10 @@ class _ChoiceGroupState extends State<_ChoiceGroup> {
   Widget _chip(_Choice c) {
     final hl = _inHold ? _held : _current;
     final on = c.key.isNotEmpty && hl == c.key;
-    final a = widget.accent;
+    // Warna berjenjang: opsi punya warna sendiri → pakai itu;
+    // kalau tidak, jatuh ke warna grup. Chip aktif menyala dengan
+    // warna khasnya sehingga tiap pilihan langsung terbaca maknanya.
+    final a = c.accent ?? widget.accent;
     return Tap(
       onTap: () => _apply(c),
       child: AnimatedContainer(
@@ -3884,6 +3978,15 @@ class _ChoiceGroupState extends State<_ChoiceGroup> {
             Icon(Icons.warning_amber_rounded,
                 color: kRed.withOpacity(.7), size: 12),
             const SizedBox(width: 5),
+          ] else if (c.accent != null) ...[
+            // Identitas warna opsi tetap terlihat walau belum dipilih.
+            Container(
+                width: 6,
+                height: 6,
+                margin: const EdgeInsets.only(right: 6),
+                decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: c.accent!.withOpacity(.55))),
           ],
           Column(
               mainAxisSize: MainAxisSize.min,
@@ -3995,7 +4098,7 @@ class _QuickTileState extends State<_QuickTile> {
     _running = true;
     try {
       final out = isRootNotifier.value
-          ? await Root.exec(a.cmd)
+          ? (a.readOnly ? await Root.exec(a.cmd) : await Root.write(a.cmd))
           : await Sys.sh(a.cmd); // jalur non-root untuk aksi readOnly
       if (!mounted) return;
       final isErr = out.startsWith('ERR');
@@ -4584,7 +4687,7 @@ class AboutTab extends StatelessWidget {
                                     Icons.developer_board_rounded,
                                     kCyan),
                                 const SizedBox(width: 8),
-                                _chip('v2.2', Icons.rocket_launch_rounded,
+                                _chip('v2.3', Icons.rocket_launch_rounded,
                                     kPurple),
                               ]),
                         ])),
