@@ -4164,60 +4164,95 @@ class ToolsTab extends StatelessWidget {
   Widget _tool(BuildContext context, String title, String desc, IconData icon,
           Color color, bool needRoot, String cmd) =>
       Padding(
-        padding: const EdgeInsets.only(bottom: 8),
+        padding: const EdgeInsets.only(bottom: 9),
         child: Tap(
           onTap: () => _run(context, title, cmd, needRoot: needRoot),
           child: Container(
             padding:
                 const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
             decoration: BoxDecoration(
-                color: kPanel,
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: kBorder)),
+              gradient: LinearGradient(
+                begin: Alignment.centerLeft,
+                end: Alignment.centerRight,
+                colors: [color.withOpacity(.05), kPanel],
+                stops: const [0, .35],
+              ),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: color.withOpacity(.22)),
+              boxShadow: [
+                BoxShadow(
+                    color: color.withOpacity(.06),
+                    blurRadius: 14,
+                    spreadRadius: -4),
+              ],
+            ),
             child: Row(children: [
+              // ── Ikon dalam bingkai bergaya HUD: sudut ganda + glow ──
               Container(
-                  padding: const EdgeInsets.all(9),
-                  decoration: BoxDecoration(
-                      color: color.withOpacity(.1),
-                      borderRadius: BorderRadius.circular(11)),
-                  child: Icon(icon, color: color, size: 18)),
-              const SizedBox(width: 12),
+                width: 38,
+                height: 38,
+                decoration: BoxDecoration(
+                  color: color.withOpacity(.09),
+                  borderRadius: BorderRadius.circular(11),
+                  border: Border.all(color: color.withOpacity(.35)),
+                ),
+                child: Icon(icon, color: color, size: 18),
+              ),
+              const SizedBox(width: 13),
               Expanded(
                   child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                     Row(children: [
                       Flexible(
-                          child: Text(title,
+                          child: Text(title.toUpperCase(),
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                               style: TextStyle(
                                   color: kWhite,
-                                  fontSize: 12.5,
-                                  fontWeight: FontWeight.w700))),
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w700,
+                                  fontFamily: 'monospace',
+                                  letterSpacing: .6))),
                       if (needRoot) ...[
-                        const SizedBox(width: 6),
+                        const SizedBox(width: 7),
                         Container(
                             padding: const EdgeInsets.symmetric(
-                                horizontal: 5, vertical: 1.5),
+                                horizontal: 6, vertical: 2),
                             decoration: BoxDecoration(
-                                color: kRed.withOpacity(.1),
-                                borderRadius: BorderRadius.circular(5)),
+                                color: kRed.withOpacity(.12),
+                                borderRadius: BorderRadius.circular(5),
+                                border:
+                                    Border.all(color: kRed.withOpacity(.5))),
                             child: Text('ROOT',
                                 style: TextStyle(
                                     color: kRed,
                                     fontSize: 7.5,
                                     fontWeight: FontWeight.w900,
-                                    letterSpacing: .8))),
+                                    fontFamily: 'monospace',
+                                    letterSpacing: 1.2))),
                       ],
                     ]),
-                    const SizedBox(height: 2),
+                    const SizedBox(height: 3),
                     Text(desc,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: TextStyle(color: mut(.38), fontSize: 10.5)),
+                        style: TextStyle(
+                            color: mut(.36),
+                            fontSize: 10,
+                            fontFamily: 'monospace',
+                            letterSpacing: .1)),
                   ])),
-              Icon(Icons.chevron_right_rounded, color: mut(.25), size: 18),
+              const SizedBox(width: 6),
+              Container(
+                padding: const EdgeInsets.all(4),
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  border: Border.all(color: mut(.12)),
+                ),
+                child: Icon(Icons.arrow_forward_rounded,
+                    color: color.withOpacity(.6), size: 13),
+              ),
             ]),
           ),
         ),
